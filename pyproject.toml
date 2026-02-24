@@ -9,6 +9,11 @@ description = "MCP server for SEC EDGAR financial data - 6 tools for filings, fi
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+
+[project.urls]
+Homepage = "https://github.com/henrysouchien/edgar-mcp"
+Source = "https://github.com/henrysouchien/edgar-mcp"
+Issues = "https://github.com/henrysouchien/edgar-mcp/issues"
 dependencies = [
     "requests",
     "fastmcp",
