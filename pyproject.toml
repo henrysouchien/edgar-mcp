@@ -4,20 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edgar-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for SEC EDGAR financial data - 6 tools for filings, financials, and metrics"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+dependencies = [
+    "requests",
+    "fastmcp",
+]
 
 [project.urls]
 Homepage = "https://github.com/henrysouchien/edgar-mcp"
 Source = "https://github.com/henrysouchien/edgar-mcp"
 Issues = "https://github.com/henrysouchien/edgar-mcp/issues"
-dependencies = [
-    "requests",
-    "fastmcp",
-]
 
 [project.scripts]
 edgar-mcp = "edgar_mcp.server:main"
