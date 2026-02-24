@@ -51,3 +51,7 @@ Claude Code config snippet:
 
 - Python 3.11+
 - EDGAR API key
+
+## See also
+
+- **[edgar-parser](https://github.com/henrysouchien/edgar-parser)** — The underlying Python library for parsing SEC EDGAR filings. Use this directly if you want to integrate EDGAR data into your own Python application without MCP.
