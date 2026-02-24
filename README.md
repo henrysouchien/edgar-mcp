@@ -9,7 +9,7 @@ SEC EDGAR financial data for your AI agent.
 - `get_metric`: fetch a specific metric/tag for a period
 - `list_metrics`: list candidate metrics/tags in a filing period
 - `search_metrics`: fuzzy-search metrics by natural-language query
-- `get_filing_sections`: extract filing narrative sections/tables (inline or file output)
+- `get_filing_sections`: extract filing narrative sections/tables (10-K/10-Q default, or 8-K earnings release with `source="8k"`)
 
 ## Install
 
