@@ -297,6 +297,15 @@ def _score_metric_match(query: str, metric: dict) -> float:
     return round(best_score, 2)
 
 
+def _normalize_sections_source(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower().replace("-", "")
+    if not cleaned:
+        return None
+    return cleaned
+
+
 def _deadline_expired(args: dict) -> bool:
     """Cooperative timeout check for worker-thread handlers."""
     deadline = args.get("__deadline_monotonic")
@@ -486,6 +495,13 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     output_mode = args.get("output", "file")
     sections_list = args.get("sections")
     tables_only = args.get("tables_only", False)
+    source_raw = args.get("source")
+    source = _normalize_sections_source(source_raw)
+    if source not in (None, "8k"):
+        return {
+            "status": "error",
+            "message": f"Invalid source: '{source_raw}'. Supported values: '8k' or omit for 10-K/10-Q.",
+        }
 
     # Build remote API params
     params = {
@@ -494,6 +510,8 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         "quarter": args["quarter"],
         "format": args.get("format", "summary"),
     }
+    if source is not None:
+        params["source"] = source
     if sections_list:
         params["sections"] = ",".join(sections_list)
 
@@ -552,12 +570,13 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     FILE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Build filename
+    source_suffix = "_8k" if source == "8k" else ""
     if sections_list:
         safe_keys = [_safe_filename_part(key, "section") for key in sorted(sections_list)]
         keys_part = "_".join(safe_keys)
-        filename = f"{ticker}_{quarter}Q{year % 100:02d}_{keys_part}.md"
+        filename = f"{ticker}_{quarter}Q{year % 100:02d}{source_suffix}_{keys_part}.md"
     else:
-        filename = f"{ticker}_{quarter}Q{year % 100:02d}_sections.md"
+        filename = f"{ticker}_{quarter}Q{year % 100:02d}{source_suffix}_sections.md"
     file_path = (FILE_OUTPUT_DIR / filename).resolve()
     root_dir = FILE_OUTPUT_DIR.resolve()
     if not file_path.is_relative_to(root_dir):
@@ -831,14 +850,15 @@ async def get_filing_sections(
     year: int,
     quarter: int,
     sections: list[str] | None = None,
+    source: Literal["8k"] | None = None,
     format: Literal["summary", "full"] = "summary",
     max_words: int | None = 3000,
     tables_only: bool = False,
     output: Literal["inline", "file"] = "file",
 ) -> dict:
     """
-    Parse qualitative sections from SEC 10-K or 10-Q filings and return
-    narrative/tables with metadata.
+    Parse qualitative sections from SEC filings and return narrative/tables with metadata.
+    Pass source="8k" to parse an earnings-release 8-K exhibit instead of 10-K/10-Q.
     """
     args = {
         "ticker": ticker,
@@ -851,6 +871,8 @@ async def get_filing_sections(
     }
     if sections:
         args["sections"] = sections
+    if source is not None:
+        args["source"] = source
     return await _run_tool_guarded("get_filing_sections", args)
 
 
