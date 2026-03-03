@@ -70,7 +70,7 @@ def _get_api_config():
     return base_url, api_key
 
 
-def _call_api(path: str, params: dict, timeout: int = 60) -> dict:
+def _call_api(path: str, params: dict, timeout: int = 300) -> dict:
     """HTTP GET to the remote EDGAR API. Returns parsed JSON or error dict."""
     base_url, api_key = _get_api_config()
     if not api_key:
@@ -205,6 +205,15 @@ def _normalize_date_type(value: object) -> str | None:
     return normalized if normalized in {"Q", "YTD", "FY"} else None
 
 
+def _normalize_sections_source(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower().replace("-", "")
+    if not cleaned:
+        return None
+    return cleaned
+
+
 def _build_metric_catalog(financials_result: dict, date_type: str | None = None) -> list[dict]:
     """Create a deduplicated metric catalog from /api/financials facts."""
     facts = financials_result.get("facts")
@@ -295,15 +304,6 @@ def _score_metric_match(query: str, metric: dict) -> float:
                 best_score = max(best_score, 45.0 + (ratio * 35.0))
 
     return round(best_score, 2)
-
-
-def _normalize_sections_source(value: object) -> str | None:
-    if value is None:
-        return None
-    cleaned = str(value).strip().lower().replace("-", "")
-    if not cleaned:
-        return None
-    return cleaned
 
 
 def _deadline_expired(args: dict) -> bool:
@@ -674,11 +674,11 @@ _TOOL_DISPATCH = {
 
 _TOOL_TIMEOUT = {
     "get_filings": 30,
-    "get_financials": 60,
-    "get_metric": 30,
-    "list_metrics": 45,
-    "search_metrics": 45,
-    "get_filing_sections": 60,
+    "get_financials": 300,
+    "get_metric": 300,
+    "list_metrics": 300,
+    "search_metrics": 300,
+    "get_filing_sections": 300,
 }
 
 
@@ -857,8 +857,8 @@ async def get_filing_sections(
     output: Literal["inline", "file"] = "file",
 ) -> dict:
     """
-    Parse qualitative sections from SEC filings and return narrative/tables with metadata.
-    Pass source="8k" to parse an earnings-release 8-K exhibit instead of 10-K/10-Q.
+    Parse qualitative sections from SEC filings and return narrative/tables
+    with metadata. Use source='8k' for 8-K earnings release sections.
     """
     args = {
         "ticker": ticker,
@@ -891,5 +891,34 @@ def main() -> None:
     mcp.run()
 
 
+def _kill_previous_instance():
+    """Kill any previous edgar MCP server instance spawned by the same parent session."""
+    import signal
+    from pathlib import Path
+    server_dir = Path(__file__).resolve().parent
+    ppid = os.getppid()
+    pid_file = server_dir / f".edgar_mcp_server_{ppid}.pid"
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    pid_file.write_text(str(os.getpid()))
+    # Clean up stale PID files from dead sessions
+    for stale in server_dir.glob(".edgar_mcp_server_*.pid"):
+        if stale == pid_file:
+            continue
+        try:
+            session_pid = int(stale.stem.split("_")[-1])
+            os.kill(session_pid, 0)  # check if parent session is alive
+        except (ValueError, ProcessLookupError):
+            stale.unlink(missing_ok=True)
+        except PermissionError:
+            pass  # process exists but owned by another user
+
+
 if __name__ == "__main__":
+    _kill_previous_instance()
     main()
