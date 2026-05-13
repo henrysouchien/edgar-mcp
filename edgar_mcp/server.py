@@ -4850,6 +4850,13 @@ async def get_filing_document(
     ## SECTION: headers. Supports section filtering and pagination via char
     range or max_chars cap. Cache backed; cold builds run the section parser
     without LLM extraction.
+
+    sections accepts canonical keys such as item_1a, item_7, item_7a,
+    item_8, part1_item1, part1_item2, and proxy_statement; Item notation such
+    as "Item 7" is also accepted. Common aliases include MD&A, Risk Factors,
+    Financial Statements, Notes, Debt, Leases, Non-GAAP reconciliation,
+    Director Compensation, Voting Rights, and Proposal 1. For narrow topical
+    phrases inside a filing section, prefer search_filing_text first.
     """
     args: dict[str, Any] = {
         "ticker": ticker,
