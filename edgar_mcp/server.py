@@ -4364,9 +4364,13 @@ async def get_event_filings(
     """
     Discover SEC event filings by ticker/CIK, filing-date range, and form type.
     Use this for deal, financing, proxy, filed-communication, and status-update
-    materials that are not tied to a fiscal quarter's 10-K/10-Q. Returns
-    accession, form, filing date, primary document URL, and deterministic
-    event_type labels; it does not perform broad corpus search.
+    materials that are not tied to a fiscal quarter's 10-K/10-Q. Do not pass
+    10-K or 10-Q here; use get_filings for periodic filing discovery, or
+    get_filing_document/get_filing_sections when periodic filing content is
+    needed. Event-form examples include 8-K, 425, proxy forms, S-3/S-3ASR,
+    S-4, FWP, 424B*, 8-A12B, CERT, and SC 13D. Returns accession, form, filing
+    date, primary document URL, and deterministic event_type labels; it does
+    not perform broad corpus search.
     """
     return await _run_tool_guarded(
         "get_event_filings",
