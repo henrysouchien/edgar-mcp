@@ -19,7 +19,6 @@ import os
 import re
 import time
 from contextlib import redirect_stdout
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -38,40 +37,6 @@ ROW_CLASS_SEGMENT_MEMBER = "segment_member"
 _ROW_CLASS_SUBTOTAL = "subtotal_or_total"
 _ROW_CLASS_UNKNOWN = "unknown"
 
-_ROLE_DISCLOSURE_REJECT = (
-    "details",
-    "detail",
-    "additional",
-    "schedule",
-    "computation",
-    "narrative",
-    "supplemental",
-    "disclosure",
-)
-_ROLE_BS_RE = re.compile(
-    r"(balancesheets?)"
-    r"|(statements?of.*(balance|financialposition|financialcondition|condition|capitalization))"
-    r"|(financialposition|financialcondition)"
-)
-_ROLE_IS_RE = re.compile(
-    r"(incomestatements?)"
-    r"|((?!.*comprehensive)statements?of.*(income|earnings|operations))"
-)
-_ROLE_CI_RE = re.compile(r"(statements?of.*comprehensive)|(comprehensive(income|loss))")
-_ROLE_EQ_RE = re.compile(
-    r"((stockholders|shareholders|shareowners|partners|member)(equity|deficit|investment|capital))"
-    r"|(statements?of.*(equity|capital|investment|deficit))"
-    r"|(changesin.*(equity|capital|investment))"
-)
-_ROLE_CF_RE = re.compile(r"(cashflow(s)?statement(s)?)|(statements?of.*cashflow)|(cashflow)")
-_ROLE_BUCKETS = (
-    ("BS", _ROLE_BS_RE),
-    ("IS", _ROLE_IS_RE),
-    ("CI", _ROLE_CI_RE),
-    ("EQ", _ROLE_EQ_RE),
-    ("CF", _ROLE_CF_RE),
-    ("DISC", None),
-)
 _FRIENDLY_ROLE_NAMES = (
     "balance_sheet",
     "income_statement",
@@ -80,14 +45,6 @@ _FRIENDLY_ROLE_NAMES = (
     "cash_flow",
     "other",
 )
-_FRIENDLY_ROLE_BY_BUCKET = {
-    "BS": "balance_sheet",
-    "IS": "income_statement",
-    "CI": "comprehensive_income",
-    "EQ": "equity",
-    "CF": "cash_flow",
-    "DISC": "other",
-}
 
 _RATIO_LABEL_KEYWORDS = ("margin", "rate", "ratio", "yield", "penetration", "take rate", "mix")
 _PRICE_KEYWORDS = (
@@ -125,26 +82,6 @@ _VOLUME_KEYWORDS = (
 )
 
 
-def _role_canonicalize(role: str) -> str:
-    return str(role or "").lower().replace("-", "").replace("_", "").replace(" ", "")
-
-
-def _role_bucket(role: str) -> str:
-    canon = _role_canonicalize(role)
-    if not canon:
-        return "DISC"
-    if any(marker in canon for marker in _ROLE_DISCLOSURE_REJECT):
-        return "DISC"
-    for name, pattern in _ROLE_BUCKETS:
-        if pattern is not None and pattern.search(canon):
-            return name
-    return "DISC"
-
-
-def _friendly_role(bucket_name: str) -> str:
-    return _FRIENDLY_ROLE_BY_BUCKET.get(bucket_name, "other")
-
-
 def normalize_role_filter(raw: str | None) -> tuple[str, ...]:
     """Canonicalize comma-separated statement role filters for MCP requests."""
     if raw is None:
@@ -158,29 +95,6 @@ def normalize_role_filter(raw: str | None) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"Unknown statement role: {unknown[0]}")
     return tuple(sorted(values))
-
-
-def enrich_match_metadata(fact: dict) -> dict[str, Any]:
-    """Return statement-role metadata derived from one API fact."""
-    raw_role = fact.get("presentation_role")
-    roles = []
-    if raw_role is not None:
-        roles = [role.strip() for role in str(raw_role).split("|") if role.strip()]
-
-    presentation_roles = sorted(set(roles))
-    statement_roles = sorted({_friendly_role(_role_bucket(role)) for role in roles})
-    metadata: dict[str, Any] = {
-        "presentation_roles": presentation_roles,
-        "statement_roles": statement_roles,
-        "statement_position": (
-            "aggregate"
-            if fact.get("axis_key") in (None, "", "__NONE__")
-            else "dimensional"
-        ),
-    }
-    if len(statement_roles) == 1:
-        metadata["statement_role"] = statement_roles[0]
-    return metadata
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -413,28 +327,8 @@ def _safe_filename_part(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-def _pick_metric_values(fact: dict) -> tuple[object, object]:
-    """Mirror /api/metric value precedence for a fact record."""
-    current = fact.get("current_value")
-    if current is None:
-        current = fact.get("visual_current_value")
-    if current is None:
-        current = fact.get("current_period_value")
-
-    prior = fact.get("prior_value")
-    if prior is None:
-        prior = fact.get("visual_prior_value")
-    if prior is None:
-        prior = fact.get("prior_period_value")
-
-    return current, prior
-
-
 def _split_identifier_tokens(value: object) -> list[str]:
-    """
-    Tokenize metric/tag text for fuzzy matching.
-    Handles namespace separators, camel/Pascal case, and punctuation.
-    """
+    """Tokenize metric/tag text for local hints and validation."""
     if value is None:
         return []
 
@@ -445,321 +339,6 @@ def _split_identifier_tokens(value: object) -> list[str]:
     text = text.replace("-", " ").replace("_", " ")
     text = re.sub(r"[^A-Za-z0-9]+", " ", text)
     return [token for token in text.lower().split() if token]
-
-
-_SEARCH_QUERY_PHRASE_ALIASES = {
-    "eps": ["earnings", "per", "share"],
-    "diluted eps": ["earnings", "per", "share", "diluted"],
-    "basic eps": ["earnings", "per", "share", "basic"],
-    "revenue": ["revenue", "from", "contract", "with", "customer"],
-    "capex": ["capital", "expenditures", "payments", "to", "acquire", "property", "plant", "and", "equipment"],
-    "d a": ["depreciation", "and", "amortization"],
-    "da": ["depreciation", "and", "amortization"],
-    "sg a": ["selling", "general", "and", "administrative"],
-    "sga": ["selling", "general", "and", "administrative"],
-    "r d": ["research", "and", "development"],
-    "cogs": ["cost", "of", "goods", "sold", "cost", "of", "revenue"],
-    "fcf": ["free", "cash", "flow"],
-    "cfo": ["operating", "cash", "flow"],
-    "ocf": ["operating", "cash", "flow", "net", "cash", "provided", "by", "operating", "activities"],
-    "ppe": ["property", "plant", "and", "equipment"],
-    "goodwill": ["goodwill"],
-    "shares outstanding": ["common", "stock", "shares", "outstanding"],
-}
-
-_SEARCH_QUERY_TOKEN_ALIASES = {
-    "eps": ["earnings", "per", "share"],
-    "rev": ["revenue"],
-    "capex": ["capital", "expenditures"],
-    "ocf": ["operating", "cash", "flow"],
-    "fcf": ["free", "cash", "flow"],
-    "cogs": ["cost", "of", "revenue"],
-    "ppe": ["property", "plant", "and", "equipment"],
-    "sga": ["selling", "general", "and", "administrative"],
-    "da": ["depreciation", "and", "amortization"],
-    "cfo": ["operating", "cash", "flow"],
-}
-
-_METRIC_SEARCH_STOP_TOKENS = {
-    "a",
-    "an",
-    "and",
-    "as",
-    "at",
-    "by",
-    "for",
-    "from",
-    "in",
-    "including",
-    "excluding",
-    "of",
-    "on",
-    "the",
-    "to",
-    "with",
-}
-
-_METRIC_SEARCH_FAMILY_BASE_TOKENS = {
-    "assets_total": {"asset", "assets", "total"},
-    "assets_current": {"asset", "assets", "current"},
-    "assets_noncurrent": {"asset", "assets", "non", "noncurrent"},
-    "cash_and_cash_equivalents": {"cash", "equivalent", "equivalents"},
-    "cash_restricted_total": {"cash", "equivalent", "equivalents", "restricted", "total"},
-    "operating_cash_flow": {
-        "activities",
-        "activity",
-        "cash",
-        "cfo",
-        "flow",
-        "net",
-        "ocf",
-        "operating",
-        "provided",
-        "used",
-    },
-    "debt_total": {
-        "borrowing",
-        "borrowings",
-        "capital",
-        "debt",
-        "lease",
-        "leases",
-        "long",
-        "obligation",
-        "obligations",
-        "term",
-        "total",
-    },
-    "debt_current": {"borrowing", "borrowings", "current", "debt", "lease", "leases"},
-    "debt_noncurrent": {"borrowing", "borrowings", "debt", "lease", "leases", "non", "noncurrent"},
-    "equity_total": {"equity", "shareholder", "shareholders", "stockholder", "stockholders", "total"},
-    "liabilities_and_equity": {
-        "equity",
-        "liabilities",
-        "liability",
-        "shareholder",
-        "shareholders",
-        "stockholder",
-        "stockholders",
-        "total",
-    },
-    "liabilities_total": {"liabilities", "liability", "total"},
-    "liabilities_current": {"current", "liabilities", "liability"},
-    "liabilities_noncurrent": {"liabilities", "liability", "non", "noncurrent"},
-    "operating_income": {"income", "loss", "operating"},
-    "revenue": {
-        "assessed",
-        "contract",
-        "customer",
-        "customers",
-        "net",
-        "revenue",
-        "revenues",
-        "sale",
-        "sales",
-        "tax",
-        "total",
-    },
-}
-
-_METRIC_SEARCH_OPERATIONAL_REVENUE_TOKENS = {
-    "account",
-    "accounts",
-    "customer",
-    "customers",
-    "member",
-    "members",
-    "membership",
-    "memberships",
-    "subscriber",
-    "subscribers",
-    "subscription",
-    "subscriptions",
-    "user",
-    "users",
-}
-
-_METRIC_SEARCH_REQUIRED_TOKEN_ALIASES = {
-    "account": {"account", "accounts"},
-    "accounts": {"account", "accounts"},
-    "customer": {"customer", "customers"},
-    "customers": {"customer", "customers"},
-    "member": {"member", "members", "membership", "memberships"},
-    "members": {"member", "members", "membership", "memberships"},
-    "membership": {"member", "members", "membership", "memberships"},
-    "memberships": {"member", "members", "membership", "memberships"},
-    "subscriber": {"subscriber", "subscribers", "subscription", "subscriptions"},
-    "subscribers": {"subscriber", "subscribers", "subscription", "subscriptions"},
-    "subscription": {"subscriber", "subscribers", "subscription", "subscriptions"},
-    "subscriptions": {"subscriber", "subscribers", "subscription", "subscriptions"},
-    "user": {"user", "users"},
-    "users": {"user", "users"},
-    "continuing": {"continuing", "continued"},
-    "continued": {"continuing", "continued"},
-    "discontinued": {"discontinued"},
-    "operation": {"operation", "operations"},
-    "operations": {"operation", "operations"},
-}
-
-
-def _expand_query_variants(query: str) -> list[list[str]]:
-    """Return tokenized query variants for robust matching."""
-    base_tokens = _split_identifier_tokens(query)
-    if not base_tokens:
-        return []
-
-    variants = {tuple(base_tokens)}
-
-    base_phrase = " ".join(base_tokens)
-    phrase_alias = _SEARCH_QUERY_PHRASE_ALIASES.get(base_phrase)
-    if phrase_alias:
-        variants.add(tuple(phrase_alias))
-
-    for i, token in enumerate(base_tokens):
-        replacement = _SEARCH_QUERY_TOKEN_ALIASES.get(token)
-        if replacement:
-            expanded = base_tokens[:i] + replacement + base_tokens[i + 1 :]
-            variants.add(tuple(expanded))
-            if token == "eps" and "diluted" in base_tokens:
-                variants.add(tuple(["earnings", "per", "share", "diluted"]))
-            if token == "eps" and "basic" in base_tokens:
-                variants.add(tuple(["earnings", "per", "share", "basic"]))
-
-    return [list(variant) for variant in variants]
-
-
-def _meaningful_metric_search_tokens(tokens: list[str]) -> set[str]:
-    return {token for token in tokens if token not in _METRIC_SEARCH_STOP_TOKENS}
-
-
-def _metric_search_tokens(metric: dict) -> list[str]:
-    metric_tokens = _split_identifier_tokens(metric.get("metric_name", ""))
-    metric_tokens += _split_identifier_tokens(metric.get("tag", ""))
-    metric_tokens += _split_identifier_tokens(metric.get("concept_label", ""))
-    date_type = _normalize_date_type(metric.get("date_type"))
-    if date_type:
-        metric_tokens.append(date_type.lower())
-    return metric_tokens
-
-
-def _metric_search_token_sets(metric: dict) -> tuple[set[str], set[str]]:
-    metric_tokens = _metric_search_tokens(metric)
-    dimension_tokens = set()
-    for dim in metric.get("dimensions") or []:
-        if not isinstance(dim, dict):
-            continue
-        for field in (dim.get("axis_label", ""), dim.get("member_label", "")):
-            tokens = _split_identifier_tokens(field)
-            dimension_tokens.update(tokens)
-            if tokens:
-                dimension_tokens.add("".join(tokens))
-
-    return set(metric_tokens), dimension_tokens
-
-
-def _metric_search_query_profile(query: str, query_family: str | None) -> dict:
-    tokens = _meaningful_metric_search_tokens(_split_identifier_tokens(query))
-    family_tokens = _METRIC_SEARCH_FAMILY_BASE_TOKENS.get(query_family or "", set())
-    if query_family == "operating_cash_flow" and not (tokens & {"continuing", "continued", "discontinued"}):
-        family_tokens = family_tokens | {"operation", "operations"}
-    required_modifiers = set()
-    if query_family:
-        required_modifiers = {
-            token
-            for token in tokens
-            if token not in family_tokens
-        }
-
-    is_operational_revenue_kpi = (
-        query_family == "revenue"
-        and bool(tokens & _METRIC_SEARCH_OPERATIONAL_REVENUE_TOKENS)
-        and bool(tokens & {"average", "per", "arpu", "arm"})
-    )
-    if is_operational_revenue_kpi:
-        required_modifiers.update(tokens & _METRIC_SEARCH_OPERATIONAL_REVENUE_TOKENS)
-        required_modifiers.update(tokens & {"average", "per", "arpu", "arm"})
-
-    return {
-        "tokens": tokens,
-        "required_modifiers": required_modifiers,
-        "is_operational_revenue_kpi": is_operational_revenue_kpi,
-    }
-
-
-def _metric_search_required_modifier_evidence(query_profile: dict, metric: dict) -> dict:
-    required_modifiers = set(query_profile.get("required_modifiers") or [])
-    if not required_modifiers:
-        return {"matched": set(), "unmatched": set()}
-
-    metric_tokens, dimension_tokens = _metric_search_token_sets(metric)
-    candidate_tokens = metric_tokens | dimension_tokens
-    matched = set()
-    for token in required_modifiers:
-        aliases = _METRIC_SEARCH_REQUIRED_TOKEN_ALIASES.get(token, {token})
-        if aliases & candidate_tokens:
-            matched.add(token)
-
-    return {
-        "matched": matched,
-        "unmatched": required_modifiers - matched,
-    }
-
-
-def _metric_search_apply_modifier_gate(
-    score: float,
-    *,
-    query_profile: dict,
-    modifier_evidence: dict,
-    semantic_relation: str | None,
-) -> float:
-    required_modifiers = set(query_profile.get("required_modifiers") or [])
-    if not required_modifiers or not score:
-        return score
-
-    matched = set(modifier_evidence.get("matched") or [])
-    unmatched = set(modifier_evidence.get("unmatched") or [])
-    if not unmatched:
-        return score
-
-    if not matched:
-        if semantic_relation == "exact":
-            return min(score, 60.0)
-        if semantic_relation == "related":
-            return min(score, 54.0)
-        return 0.0 if score < 90.0 else min(score, 72.0)
-
-    modifier_coverage = len(matched) / max(len(required_modifiers), 1)
-    return min(score, 64.0 + (modifier_coverage * 16.0))
-
-
-def _metric_search_confidence(query_profile: dict, ranked: list[dict]) -> tuple[bool, str | None]:
-    required_modifiers = set(query_profile.get("required_modifiers") or [])
-    if not ranked:
-        return True, "No XBRL metrics matched the query."
-
-    if required_modifiers:
-        strong_match = any(
-            not match.get("unmatched_query_modifiers")
-            and float(match.get("match_score") or 0) >= 75.0
-            for match in ranked
-        )
-        if not strong_match:
-            missing = sorted(required_modifiers)
-            reason = (
-                "No strong XBRL metric matched required query modifiers: "
-                + ", ".join(missing)
-                + "."
-            )
-            if query_profile.get("is_operational_revenue_kpi"):
-                reason += " This looks like an operational KPI that may live in narrative tables, not tagged XBRL."
-            return True, reason
-
-    top_scores = {match.get("match_score") for match in ranked[: min(len(ranked), 5)]}
-    top_score = float(ranked[0].get("match_score") or 0)
-    if len(top_scores) == 1 and len(ranked) > 1 and top_score < 75.0:
-        return True, "Top candidates have uniform low scores; validate manually before using a match."
-
-    return False, None
 
 
 def _normalize_date_type(value: object) -> str | None:
@@ -811,349 +390,12 @@ def _role_query_param(role: object) -> str | None:
     return ",".join(normalized) if normalized else None
 
 
-def _normalize_tag_local_name(value: object) -> str:
-    raw = str(value or "")
-    local = raw.split(":", 1)[1] if ":" in raw else raw
-    return re.sub(r"[^a-z0-9]", "", local.lower())
-
-
-_BALANCE_SHEET_LOCAL_NAMES = {
-    "assets",
-    "assetscurrent",
-    "assetsnoncurrent",
-    "cashandcashequivalentsatcarryingvalue",
-    "cashcashequivalentsrestrictedcashandrestrictedcashequivalents",
-    "liabilities",
-    "liabilitiescurrent",
-    "liabilitiesnoncurrent",
-    "liabilitiesandstockholdersequity",
-    "liabilitiesandstockholdersequityincludingportionattributabletononcontrollinginterest",
-    "longtermdebtandcapitalleaseobligations",
-    "longtermdebtcurrent",
-    "longtermdebtnoncurrent",
-    "stockholdersequity",
-    "stockholdersequityincludingportionattributabletononcontrollinginterest",
-}
-
-
-_METRIC_SEMANTIC_FAMILIES_BY_LOCAL_NAME = {
-    "assets": "assets_total",
-    "assetscurrent": "assets_current",
-    "assetsnoncurrent": "assets_noncurrent",
-    "cashandcashequivalentsatcarryingvalue": "cash_and_cash_equivalents",
-    "cashcashequivalentsrestrictedcashandrestrictedcashequivalents": "cash_restricted_total",
-    "liabilities": "liabilities_total",
-    "liabilitiescurrent": "liabilities_current",
-    "liabilitiesnoncurrent": "liabilities_noncurrent",
-    "liabilitiesandpartnerscapital": "liabilities_and_equity",
-    "liabilitiesandstockholdersequity": "liabilities_and_equity",
-    "liabilitiesandstockholdersequityincludingportionattributabletononcontrollinginterest": "liabilities_and_equity",
-    "longtermdebtandcapitalleaseobligations": "debt_total",
-    "longtermdebtcurrent": "debt_current",
-    "longtermdebtnoncurrent": "debt_noncurrent",
-    "netcashprovidedbyusedinoperatingactivities": "operating_cash_flow",
-    "netcashprovidedbyusedinoperatingactivitiescontinuingoperations": "operating_cash_flow",
-    "operatingincomeloss": "operating_income",
-    "revenue": "revenue",
-    "revenues": "revenue",
-    "revenuefromcontractwithcustomerexcludingassessedtax": "revenue",
-    "revenuefromcontractwithcustomerincludingassessedtax": "revenue",
-    "salesrevenuegoodsnet": "revenue",
-    "salesrevenuenet": "revenue",
-    "salesrevenueservicesnet": "revenue",
-    "stockholdersequity": "equity_total",
-    "stockholdersequityincludingportionattributabletononcontrollinginterest": "equity_total",
-    "totalnetsales": "revenue",
-}
-
-_LIABILITY_QUERY_TOKENS = {"liability", "liabilities"}
-_EQUITY_QUERY_TOKENS = {
-    "equity",
-    "stockholder",
-    "stockholders",
-    "shareholder",
-    "shareholders",
-}
-_ASSET_QUERY_TOKENS = {"asset", "assets"}
-_DEBT_QUERY_TOKENS = {"debt", "borrowings", "borrowing"}
-_OPERATING_CASH_FLOW_QUERY_TOKENS = {
-    "activities",
-    "activity",
-    "cfo",
-    "ocf",
-    "operating",
-    "operation",
-    "operations",
-}
-_NON_OPERATING_CASH_FLOW_QUERY_TOKENS = {
-    "financing",
-    "investing",
-}
-_FLOW_QUERY_TOKENS = {
-    "issuance",
-    "issued",
-    "proceeds",
-    "repayment",
-    "repayments",
-    "payment",
-    "payments",
-}
-
-_RELATED_METRIC_FAMILIES = {
-    "assets_total": {"assets_current", "assets_noncurrent"},
-    "assets_current": {"assets_total"},
-    "assets_noncurrent": {"assets_total"},
-    "cash_and_cash_equivalents": {"cash_restricted_total"},
-    "debt_total": {"debt_current", "debt_noncurrent"},
-    "debt_current": {"debt_total"},
-    "debt_noncurrent": {"debt_total"},
-    "liabilities_and_equity": {"equity_total", "liabilities_total"},
-    "liabilities_total": {"liabilities_current", "liabilities_noncurrent"},
-    "liabilities_current": {"liabilities_total"},
-    "liabilities_noncurrent": {"liabilities_total"},
-}
-
-_INCOMPATIBLE_METRIC_FAMILIES = {
-    "equity_total": {"liabilities_and_equity"},
-    "liabilities_total": {"liabilities_and_equity"},
-    "liabilities_current": {"liabilities_and_equity"},
-    "liabilities_noncurrent": {"liabilities_and_equity"},
-}
-
-
-def _role_looks_balance_sheet(value: object) -> bool:
-    role = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
-    if not role:
-        return False
-    return (
-        "balancesheet" in role
-        or "balancesheets" in role
-        or "statementoffinancialposition" in role
-        or "statementsoffinancialposition" in role
-    )
-
-
-def _metric_looks_balance_sheet_snapshot(fact: dict) -> bool:
-    if _normalize_tag_local_name(fact.get("tag")) in _BALANCE_SHEET_LOCAL_NAMES:
-        return True
-    if _role_looks_balance_sheet(fact.get("presentation_role")):
-        return True
-
-    hierarchy = fact.get("presentation_hierarchy")
-    if isinstance(hierarchy, list):
-        for entry in hierarchy:
-            if isinstance(entry, dict) and _role_looks_balance_sheet(entry.get("role")):
-                return True
-    return False
-
-
-_BALANCE_SHEET_QUERY_TOKENS = {
-    "asset",
-    "assets",
-    "cash",
-    "equivalent",
-    "equivalents",
-    "restricted",
-    "debt",
-    "borrowings",
-    "borrowing",
-    "lease",
-    "leases",
-    "liability",
-    "liabilities",
-    "equity",
-    "stockholders",
-    "shareholders",
-    "payable",
-    "payables",
-    "receivable",
-    "receivables",
-    "inventory",
-    "inventories",
-    "balance",
-    "sheet",
-    "current",
-    "noncurrent",
-    "non",
-}
-
-
-def _query_looks_balance_sheet_metric(query: str) -> bool:
-    tokens = set(_split_identifier_tokens(query))
-    if not tokens:
-        return False
-    return bool(tokens & _BALANCE_SHEET_QUERY_TOKENS)
-
-
-def _query_looks_operating_cash_flow_metric(tokens: set[str]) -> bool:
-    if tokens & {"cfo", "ocf"}:
-        return True
-    if {"cash", "flow"} <= tokens and not (tokens & _NON_OPERATING_CASH_FLOW_QUERY_TOKENS):
-        return bool(tokens & _OPERATING_CASH_FLOW_QUERY_TOKENS)
-    return False
-
-
-def _infer_metric_query_family(query: str) -> str | None:
-    tokens_list = _split_identifier_tokens(query)
-    tokens = set(tokens_list)
-    if not tokens:
-        return None
-
-    has_liability = bool(tokens & _LIABILITY_QUERY_TOKENS)
-    has_equity = bool(tokens & _EQUITY_QUERY_TOKENS)
-    if has_liability and has_equity:
-        return "liabilities_and_equity"
-    if has_equity:
-        return "equity_total"
-    if has_liability:
-        if "current" in tokens and "total" not in tokens:
-            return "liabilities_current"
-        if "noncurrent" in tokens or ("non" in tokens and "current" in tokens):
-            return "liabilities_noncurrent"
-        return "liabilities_total"
-
-    if tokens & _ASSET_QUERY_TOKENS:
-        if "current" in tokens and "total" not in tokens:
-            return "assets_current"
-        if "noncurrent" in tokens or ("non" in tokens and "current" in tokens):
-            return "assets_noncurrent"
-        return "assets_total"
-
-    if _query_looks_operating_cash_flow_metric(tokens):
-        return "operating_cash_flow"
-
-    if "cash" in tokens:
-        if "restricted" in tokens:
-            return "cash_restricted_total"
-        return "cash_and_cash_equivalents"
-
-    if tokens & _DEBT_QUERY_TOKENS:
-        if tokens & _FLOW_QUERY_TOKENS:
-            return None
-        if "current" in tokens and "total" not in tokens:
-            return "debt_current"
-        if "noncurrent" in tokens or ("non" in tokens and "current" in tokens):
-            return "debt_noncurrent"
-        return "debt_total"
-
-    phrase = " ".join(tokens_list)
-    if "cost" not in tokens and (
-        "revenue" in tokens
-        or "revenues" in tokens
-        or phrase in {"net sales", "total net sales", "sales revenue", "sales revenues"}
-    ):
-        return "revenue"
-
-    if {"operating", "income"} <= tokens:
-        return "operating_income"
-
-    return None
-
-
-def _metric_semantic_family(metric: dict) -> str | None:
-    for field in (metric.get("tag"), metric.get("metric_name")):
-        local_name = _normalize_tag_local_name(field)
-        family = _METRIC_SEMANTIC_FAMILIES_BY_LOCAL_NAME.get(local_name)
-        if family:
-            return family
-
-        if local_name.endswith(("liabilitiescurrent", "liabilitycurrent")):
-            return "liabilities_current"
-        if local_name.endswith(("liabilitiesnoncurrent", "liabilitynoncurrent")):
-            return "liabilities_noncurrent"
-
-    label_compact = _normalize_tag_local_name(metric.get("concept_label"))
-    if label_compact in {
-        "liabilitiesandequity",
-        "liabilitiesandstockholdersequity",
-        "liabilitiesandstockholdersequityincludingportionattributabletononcontrollinginterest",
-    }:
-        return "liabilities_and_equity"
-    if label_compact in {"netsales", "totalnetsales", "netrevenue", "netrevenues", "revenue", "revenues"}:
-        return "revenue"
-    if label_compact in {
-        "cashandcashequivalents",
-        "cashandcashequivalentsatcarryingvalue",
-    }:
-        return "cash_and_cash_equivalents"
-    if label_compact in {
-        "cashcashequivalentsrestrictedcashandrestrictedcashequivalents",
-        "cashcashequivalentsrestrictedcashandrestrictedcashequivalentsincludingdisposalgroupanddiscontinuedoperations",
-    }:
-        return "cash_restricted_total"
-    if label_compact in {
-        "netcashprovidedbyusedinoperatingactivities",
-        "netcashprovidedbyusedinoperatingactivitiescontinuingoperations",
-        "cashprovidedbyusedinoperatingactivityincludingdiscontinuedoperation",
-        "cashprovidedbyusedinoperatingactivitycontinuingoperation",
-    }:
-        return "operating_cash_flow"
-    if label_compact in {
-        "equityattributabletoparent",
-        "stockholdersequity",
-        "stockholdersequityincludingportionattributabletononcontrollinginterest",
-        "shareholdersequity",
-    }:
-        return "equity_total"
-    if label_compact == "liabilities":
-        return "liabilities_total"
-    if label_compact in {"currentliabilities", "liabilitiescurrent"}:
-        return "liabilities_current"
-    if label_compact in {"noncurrentliabilities", "liabilitiesnoncurrent"}:
-        return "liabilities_noncurrent"
-    if label_compact == "assets":
-        return "assets_total"
-    if label_compact in {"currentassets", "assetscurrent"}:
-        return "assets_current"
-    if label_compact in {"noncurrentassets", "assetsnoncurrent"}:
-        return "assets_noncurrent"
-    return None
-
-
-def _metric_family_relation(query_family: str | None, metric_family: str | None) -> str | None:
-    if not query_family or not metric_family:
-        return None
-    if query_family == metric_family:
-        return "exact"
-    if metric_family in _INCOMPATIBLE_METRIC_FAMILIES.get(query_family, set()):
-        return "incompatible"
-    if metric_family in _RELATED_METRIC_FAMILIES.get(query_family, set()):
-        return "related"
-    return None
-
-
-def _metric_semantic_score_floor(query_family: str | None, metric_family: str | None) -> float:
-    relation = _metric_family_relation(query_family, metric_family)
-    if relation == "exact":
-        return 96.0
-    if relation == "related":
-        return 72.0
-    return 0.0
-
-
-def _metric_search_candidate_allowed(query_family: str | None, metric_family: str | None) -> bool:
-    if query_family == "operating_cash_flow":
-        return metric_family == "operating_cash_flow"
-    return True
-
-
-def _catalog_date_type_matches(
-    fact: dict,
-    *,
-    fact_date_type: str | None,
-    target_date_type: str | None,
-    full_year_mode: bool,
-) -> bool:
-    if not target_date_type:
-        return True
-    if fact_date_type == target_date_type:
-        return True
-    return (
-        full_year_mode
-        and target_date_type == "FY"
-        and fact_date_type == "Q"
-        and _metric_looks_balance_sheet_snapshot(fact)
-    )
+def _bounded_int_arg(value: object, *, default: int, maximum: int) -> int:
+    raw = default if value is None else value
+    try:
+        return max(1, min(int(raw), maximum))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"limit must be an integer between 1 and {maximum}") from exc
 
 
 def _normalize_sections_source(value: object) -> str | None:
@@ -2928,180 +2170,6 @@ def _normalize_extraction_rows(items: list[dict[str, Any]]) -> list[dict[str, An
     )
 
 
-def _build_metric_catalog(
-    financials_result: dict,
-    date_type: str | None = None,
-    *,
-    full_year_mode: bool = False,
-) -> list[dict]:
-    """Create a deduplicated metric catalog from /api/financials facts."""
-    facts = financials_result.get("facts")
-    if not isinstance(facts, list):
-        return []
-
-    target_date_type = _normalize_date_type(date_type)
-    catalog = {}
-
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        raw_tag = fact.get("tag")
-        if not raw_tag or not isinstance(raw_tag, str):
-            continue
-
-        fact_date_type = _normalize_date_type(fact.get("date_type"))
-        if not _catalog_date_type_matches(
-            fact,
-            fact_date_type=fact_date_type,
-            target_date_type=target_date_type,
-            full_year_mode=full_year_mode,
-        ):
-            continue
-
-        bare_tag = raw_tag.split(":", 1)[1] if ":" in raw_tag else raw_tag
-        current, prior = _pick_metric_values(fact)
-        axis_key = str(fact.get("axis_key") or "__NONE__")
-        candidate = {
-            "metric_name": bare_tag,
-            "tag": raw_tag,
-            "concept_label": fact.get("concept_label"),
-            "date_type": fact_date_type,
-            "axis_key": axis_key,
-            "dimensions": fact.get("dimensions"),
-            "source": fact.get("source"),
-            "scale": fact.get("scale"),
-            "current_value": current,
-            "prior_value": prior,
-            "has_value": current is not None or prior is not None,
-        }
-        if fact.get("scope_status"):
-            candidate["scope_status"] = fact.get("scope_status")
-        if fact.get("scope_warning"):
-            candidate["scope_warning"] = fact.get("scope_warning")
-        if fact.get("scope_bridge_ids"):
-            candidate["scope_bridge_ids"] = fact.get("scope_bridge_ids")
-        candidate.update(enrich_match_metadata(fact))
-
-        key = (raw_tag.lower(), fact_date_type or "", axis_key)
-        existing = catalog.get(key)
-        if existing is None:
-            catalog[key] = candidate
-            continue
-
-        # Prefer entries with usable values.
-        if candidate["has_value"] and not existing["has_value"]:
-            catalog[key] = candidate
-
-    return sorted(
-        catalog.values(),
-        key=lambda item: (
-            (item["metric_name"] or "").lower(),
-            item["date_type"] or "",
-            item["axis_key"] or "",
-        ),
-    )
-
-
-def _score_metric_match(query: str, metric: dict) -> float:
-    query_variants = _expand_query_variants(query)
-    if not query_variants:
-        return 0.0
-
-    metric_tokens = _metric_search_tokens(metric)
-    if not metric_tokens:
-        return 0.0
-
-    metric_text = " ".join(metric_tokens)
-    metric_compact = "".join(metric_tokens)
-    metric_token_set, dimension_token_set = _metric_search_token_sets(metric)
-
-    best_score = 0.0
-    for query_tokens in query_variants:
-        query_text = " ".join(query_tokens)
-        query_compact = "".join(query_tokens)
-        score = 0.0
-
-        if query_text == metric_text or query_compact == metric_compact:
-            score = max(score, 100.0)
-
-        # Phrase and compact containment handle spaces/hyphens/camel-case differences.
-        if query_text and query_text in metric_text:
-            score = max(score, 94.0)
-        if query_compact and query_compact in metric_compact:
-            score = max(score, 90.0)
-
-        # Token coverage captures multi-word fuzzy matches.
-        meaningful_tokens = _meaningful_metric_search_tokens(query_tokens)
-        overlap_tokens = meaningful_tokens & metric_token_set
-        if overlap_tokens and (len(meaningful_tokens) < 3 or len(overlap_tokens) >= 2):
-            coverage = len(overlap_tokens) / max(len(meaningful_tokens), 1)
-            score = max(score, 55.0 + (coverage * 30.0))
-
-        # Final safety net for near matches.
-        if query_compact and metric_compact:
-            ratio = SequenceMatcher(None, query_compact, metric_compact).ratio()
-            if ratio >= 0.55:
-                score = max(score, 45.0 + (ratio * 35.0))
-
-        if score > 0 and any(token in dimension_token_set for token in query_tokens):
-            score += 0.1
-
-        best_score = max(best_score, score)
-
-    return round(best_score, 2)
-
-
-def _metric_dimension_score_adjustment(query: str, metric: dict) -> float:
-    query_tokens = set(_split_identifier_tokens(query))
-    if not query_tokens:
-        return 0.0
-
-    dimension_token_set = set()
-    for dim in metric.get("dimensions") or []:
-        if not isinstance(dim, dict):
-            continue
-        for field in (dim.get("axis_label", ""), dim.get("member_label", "")):
-            tokens = _split_identifier_tokens(field)
-            dimension_token_set.update(tokens)
-            if tokens:
-                dimension_token_set.add("".join(tokens))
-
-    return 0.1 if query_tokens & dimension_token_set else 0.0
-
-
-def _metric_discovery_score_adjustment(
-    query: str,
-    metric: dict,
-    *,
-    date_type: str | None,
-    full_year_mode: bool,
-    query_family: str | None = None,
-    metric_family: str | None = None,
-) -> float:
-    adjustment = 0.0
-
-    relation = _metric_family_relation(query_family, metric_family)
-    if relation == "exact":
-        adjustment += 2.0
-    elif relation == "related":
-        adjustment -= 2.0
-    elif relation == "incompatible":
-        adjustment -= 35.0
-
-    if (
-        full_year_mode
-        and date_type == "FY"
-        and _normalize_date_type(metric.get("date_type")) == "Q"
-        and _metric_looks_balance_sheet_snapshot(metric)
-    ):
-        adjustment += 0.5 if str(metric.get("axis_key") or "__NONE__") == "__NONE__" else 0.1
-        query_tokens = set(_split_identifier_tokens(query))
-        if "total" in query_tokens:
-            adjustment += 0.75
-
-    return adjustment
-
-
 def _deadline_expired(args: dict) -> bool:
     """Cooperative timeout check for worker-thread handlers."""
     deadline = args.get("__deadline_monotonic")
@@ -3430,55 +2498,23 @@ def _proxy_list_metrics(args: dict) -> dict:
         full_year_mode=args.get("full_year_mode", False),
         date_type=date_type,
     )
-    limit = args.get("limit", 200)
-    include_values = bool(args.get("include_values", True))
     try:
-        limit = max(1, min(int(limit), 1000))
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "limit must be an integer between 1 and 1000"}
+        limit = _bounded_int_arg(args.get("limit"), default=200, maximum=1000)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
-    financials = _call_api("/api/financials", {
+    params = {
         "ticker": args["ticker"],
         "year": args["year"],
         "quarter": args["quarter"],
         "full_year_mode": str(effective_full_year_mode).lower(),
         "source": args.get("source", "auto"),
-    })
-    if financials.get("status") != "success":
-        return financials
-
-    catalog = _build_metric_catalog(
-        financials,
-        date_type=date_type,
-        full_year_mode=effective_full_year_mode,
-    )
-    total_candidates = len(catalog)
-    catalog = catalog[:limit]
-
-    if not include_values:
-        for item in catalog:
-            item.pop("current_value", None)
-            item.pop("prior_value", None)
-
-    metadata = financials.get("metadata", {}) if isinstance(financials.get("metadata"), dict) else {}
-    response = {
-        "status": "success",
-        "ticker": str(args["ticker"]).upper(),
-        "year": int(args["year"]),
-        "quarter": int(args["quarter"]),
-        "full_year_mode": effective_full_year_mode,
-        "source": metadata.get("source", {}),
-        "date_type_filter": date_type,
-        "total_candidates": total_candidates,
-        "returned_candidates": len(catalog),
-        "metrics": catalog,
-        "hint": "Pass metric_name from this list into get_metric.",
+        "limit": limit,
+        "include_values": str(_truthy_bool_arg(args.get("include_values", True))).lower(),
     }
-    if financials.get("scope_warnings"):
-        response["scope_warnings"] = financials.get("scope_warnings")
-    if financials.get("scope_bridges"):
-        response["scope_bridges"] = financials.get("scope_bridges")
-    return response
+    if date_type is not None:
+        params["date_type"] = date_type
+    return _call_api("/api/financials/list_metrics", params, timeout=300)
 
 
 def _proxy_search_metrics(args: dict) -> dict:
@@ -3492,122 +2528,30 @@ def _proxy_search_metrics(args: dict) -> dict:
         full_year_mode=args.get("full_year_mode", False),
         date_type=date_type,
     )
-    expand_annual_snapshots = (
-        effective_full_year_mode
-        and _query_looks_balance_sheet_metric(query)
-    )
     try:
         role_param = _role_query_param(args.get("role"))
     except ValueError as exc:
         return {"status": "error", "message": str(exc)}
-    role_filter = set(normalize_role_filter(role_param))
-    limit = args.get("limit", 20)
-    include_values = bool(args.get("include_values", True))
     try:
-        limit = max(1, min(int(limit), 100))
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "limit must be an integer between 1 and 100"}
+        limit = _bounded_int_arg(args.get("limit"), default=20, maximum=100)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
-    financials = _call_api("/api/financials", {
+    params = {
         "ticker": args["ticker"],
         "year": args["year"],
         "quarter": args["quarter"],
+        "query": query,
         "full_year_mode": str(effective_full_year_mode).lower(),
         "source": args.get("source", "auto"),
-    })
-    if financials.get("status") != "success":
-        return financials
-
-    catalog = _build_metric_catalog(
-        financials,
-        date_type=date_type,
-        full_year_mode=expand_annual_snapshots,
-    )
-    if role_filter:
-        catalog = [
-            item
-            for item in catalog
-            if role_filter.intersection(item.get("statement_roles") or [])
-        ]
-    query_family = _infer_metric_query_family(query)
-    query_profile = _metric_search_query_profile(query, query_family)
-    ranked = []
-    for item in catalog:
-        metric_family = _metric_semantic_family(item)
-        if not _metric_search_candidate_allowed(query_family, metric_family):
-            continue
-        semantic_relation = _metric_family_relation(query_family, metric_family)
-        lexical_score = _score_metric_match(query, item)
-        semantic_floor = _metric_semantic_score_floor(query_family, metric_family)
-        score = max(lexical_score, semantic_floor)
-        if semantic_floor >= lexical_score:
-            score += _metric_dimension_score_adjustment(query, item)
-        score += _metric_discovery_score_adjustment(
-            query,
-            item,
-            date_type=date_type,
-            full_year_mode=expand_annual_snapshots,
-            query_family=query_family,
-            metric_family=metric_family,
-        )
-        modifier_evidence = _metric_search_required_modifier_evidence(query_profile, item)
-        score = _metric_search_apply_modifier_gate(
-            score,
-            query_profile=query_profile,
-            modifier_evidence=modifier_evidence,
-            semantic_relation=semantic_relation,
-        )
-        if score <= 0:
-            continue
-        match = {**item, "match_score": round(score, 2)}
-        if metric_family:
-            match["semantic_family"] = metric_family
-        if semantic_relation:
-            match["semantic_relation"] = semantic_relation
-        if query_profile["required_modifiers"]:
-            matched_modifiers = sorted(modifier_evidence["matched"])
-            unmatched_modifiers = sorted(modifier_evidence["unmatched"])
-            match["matched_query_modifiers"] = matched_modifiers
-            match["unmatched_query_modifiers"] = unmatched_modifiers
-            match["match_confidence"] = "fallback" if unmatched_modifiers else "strong"
-        ranked.append(match)
-
-    ranked.sort(key=lambda item: (-item["match_score"], item["metric_name"].lower(), item.get("date_type") or ""))
-    ranked = ranked[:limit]
-    low_confidence, confidence_reason = _metric_search_confidence(query_profile, ranked)
-
-    if not include_values:
-        for item in ranked:
-            item.pop("current_value", None)
-            item.pop("prior_value", None)
-
-    metadata = financials.get("metadata", {}) if isinstance(financials.get("metadata"), dict) else {}
-    response = {
-        "status": "success",
-        "ticker": str(args["ticker"]).upper(),
-        "year": int(args["year"]),
-        "quarter": int(args["quarter"]),
-        "full_year_mode": effective_full_year_mode,
-        "query": query,
-        "query_intent": query_family,
-        "required_query_modifiers": sorted(query_profile["required_modifiers"]),
-        "date_type_filter": date_type,
-        "source": metadata.get("source", {}),
-        "total_matches": len(ranked),
-        "matches": ranked,
-        "low_confidence": low_confidence,
-        "confidence_reason": confidence_reason,
-        "hint": (
-            "Low confidence: validate fallback matches before use; operational KPIs may require narrative/table tools."
-            if low_confidence
-            else "Use top match.metric_name with get_metric, then validate returned metric tag/value."
-        ),
+        "limit": limit,
+        "include_values": str(_truthy_bool_arg(args.get("include_values", True))).lower(),
     }
-    if financials.get("scope_warnings"):
-        response["scope_warnings"] = financials.get("scope_warnings")
-    if financials.get("scope_bridges"):
-        response["scope_bridges"] = financials.get("scope_bridges")
-    return response
+    if date_type is not None:
+        params["date_type"] = date_type
+    if role_param:
+        params["role"] = role_param
+    return _call_api("/api/financials/search_metrics", params, timeout=300)
 
 
 def _proxy_get_filing_sections(args: dict) -> dict:
