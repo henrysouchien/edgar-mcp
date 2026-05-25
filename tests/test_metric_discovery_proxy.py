@@ -6,7 +6,19 @@ def test_proxy_list_metrics_forwards_to_http_endpoint(monkeypatch):
 
     def fake_call_api(path, params, timeout=300):
         calls.append((path, params, timeout))
-        return {"status": "success", "path": path, "params": params}
+        return {
+            "status": "success",
+            "metadata": {"source": {"filing_type": "10-K"}},
+            "facts": [
+                {
+                    "tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "concept_label": "Revenue from Contract with Customer, Excluding Assessed Tax",
+                    "date_type": "FY",
+                    "current_period_value": 100.0,
+                    "prior_period_value": 90.0,
+                }
+            ],
+        }
 
     monkeypatch.setattr(server, "_call_api", fake_call_api)
 
@@ -24,20 +36,19 @@ def test_proxy_list_metrics_forwards_to_http_endpoint(monkeypatch):
     assert result["status"] == "success"
     assert calls == [
         (
-            "/api/financials/list_metrics",
+            "/api/financials",
             {
                 "ticker": "pcty",
                 "year": 2025,
                 "quarter": 4,
                 "full_year_mode": "true",
                 "source": "auto",
-                "limit": 1000,
-                "include_values": "false",
-                "date_type": "FY",
             },
             300,
         )
     ]
+    assert result["metrics"][0]["metric_name"] == "RevenueFromContractWithCustomerExcludingAssessedTax"
+    assert "current_value" not in result["metrics"][0]
 
 
 def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
@@ -45,7 +56,28 @@ def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
 
     def fake_call_api(path, params, timeout=300):
         calls.append((path, params, timeout))
-        return {"status": "success", "path": path, "params": params}
+        return {
+            "status": "success",
+            "metadata": {"source": {"filing_type": "10-Q"}},
+            "facts": [
+                {
+                    "tag": "us-gaap:LongTermDebtCurrent",
+                    "concept_label": "Long-Term Debt, Current",
+                    "date_type": "Q",
+                    "current_period_value": 10.0,
+                    "prior_period_value": 8.0,
+                    "presentation_role": "CONSOLIDATED BALANCE SHEETS",
+                },
+                {
+                    "tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "concept_label": "Revenue",
+                    "date_type": "Q",
+                    "current_period_value": 100.0,
+                    "prior_period_value": 90.0,
+                    "presentation_role": "CONSOLIDATED STATEMENTS OF OPERATIONS",
+                },
+            ],
+        }
 
     monkeypatch.setattr(server, "_call_api", fake_call_api)
 
@@ -66,21 +98,18 @@ def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
     assert result["status"] == "success"
     assert calls == [
         (
-            "/api/financials/search_metrics",
+            "/api/financials",
             {
                 "ticker": "PCTY",
                 "year": 2025,
                 "quarter": 3,
-                "query": "debt",
                 "full_year_mode": "false",
                 "source": "8k",
-                "limit": 100,
-                "include_values": "false",
-                "role": "balance_sheet,cash_flow",
             },
             300,
         )
     ]
+    assert result["matches"][0]["metric_name"] == "LongTermDebtCurrent"
 
 
 def test_proxy_search_metrics_rejects_blank_query_without_api_call(monkeypatch):
