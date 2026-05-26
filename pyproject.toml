@@ -26,4 +26,4 @@ edgar-mcp = "edgar_mcp.server:main"
 packages = ["edgar_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = ["edgar_mcp/", "pyproject.toml", "README.md", "LICENSE"]
+include = ["edgar_mcp/", "pyproject.toml", "README.md", "LICENSE", "server.json"]

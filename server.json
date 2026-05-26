@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.henrysouchien/edgar-mcp",
+  "title": "EdgarParser MCP",
+  "description": "MCP stdio server for source-backed SEC EDGAR financial data from the hosted EdgarParser API.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/henrysouchien/edgar-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "edgar-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "EDGAR_API_KEY",
+          "description": "API key for the hosted EdgarParser API.",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "EDGAR_API_URL",
+          "description": "Optional API base URL override. Defaults to https://www.edgarparser.com.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "EDGAR_MCP_OUTPUT_DIR",
+          "description": "Optional directory for output=\"file\" responses.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

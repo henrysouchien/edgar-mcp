@@ -3,6 +3,7 @@
 SEC EDGAR financial data for AI agents, exposed as an MCP stdio server.
 
 <!-- Generated from docs/tool_manifest.yaml by scripts/render_mcp_readme.py. -->
+<!-- mcp-name: io.github.henrysouchien/edgar-mcp -->
 
 ## Install
 
