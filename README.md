@@ -106,6 +106,10 @@ This package exposes 29 public MCP tools. The inventory below is generated from 
 ## Links
 
 - Hosted API: https://www.edgarparser.com
-- Developer docs: https://www.edgarparser.com/developers
+- Documentation: https://docs.edgarparser.com
+- MCP setup: https://docs.edgarparser.com/mcp
+- Tool reference: https://docs.edgarparser.com/tools
+- Changelog RSS: https://docs.edgarparser.com/rss.xml
+- In-app developer page: https://www.edgarparser.com/developers
 - Open parser package: https://github.com/henrysouchien/edgar-parser
 - Source package: https://github.com/henrysouchien/edgar-mcp
