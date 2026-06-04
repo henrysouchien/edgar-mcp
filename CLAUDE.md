@@ -38,6 +38,12 @@ Three places this shows up:
 
 **Why this exists:** silent deferral fragments coherent designs, lets bugs rot, lets contested decisions linger, and forces the user to catch every punt. This pattern has surfaced repeatedly across sessions — both design docs and implementation plans derived from them have used "build if needed" / "build if usage pressure emerges" rationale on items that don't yet exist. Make the deferral question explicit, or don't make it.
 
+## Finish and Verify
+
+Claude's instinct to reduce risk is right — but it aims it backwards: it *pauses near the end* and *softens unverified claims* because both feel cautious. They're the actual risk. A half-finished change parked as a "checkpoint" is a liability someone builds on; an unverified "it works" / "tests pass" is a false positive someone trusts. **The risk-reducing move is to finish the unit of work, and to assert only what you've verified** — not to stop short or hedge.
+
+By default: carry work to a *real* boundary — a mandated gate (plan→Codex review, ExitPlanMode, confirm-before-destructive), a decision only the user can make, or a hard blocker — not to the moment the interesting part is done; and claim "done" / "works" / "passes" only after running it, otherwise label it inferred or assumed. "It's long / tedious / I'm unsure it's wanted but it's in scope" is not a stop, and "should I continue?" when the answer is obviously yes is the bail, not diligence.
+
 ---
 
 
