@@ -12,16 +12,24 @@ NO COWBOY CODING. This codebase has carefully designed layers and abstractions. 
 
 **Why this exists**: Claude's first instinct is to glance at code and "fix" it. This almost always breaks something, misses architectural context, or produces code that doesn't match the codebase's patterns. The plan→review→implement pipeline forces proper investigation before any code is written.
 
-### Codex Implementation via MCP
+### Codex Implementation via CLI
 
-When implementing via `mcp__codex__codex` (the write-path Codex calls in step 3 of the workflow above):
+Implementation is dispatched through the `codex exec` CLI (run via Bash). The `codex` MCP server was removed 2026-06-18 — the CLI is the only dispatch path now.
 
-- **Model + reasoning:** DO NOT pass `model` or `config.model_reasoning_effort`. Inherit whatever is in `~/.codex/config.toml` — that's the source of truth and tracks the current model as it's upgraded.
-- **Approval policy:** `approval-policy: "never"`.
-- **Sandbox:** default to `sandbox: "workspace-write"`. Escalate to `"danger-full-access"` only when the task genuinely requires cross-repo, system-level, or network access — and state the reason in the prompt.
-- **Working directory:** always pass `cwd` explicitly (repo root).
+Canonical invocation — prompt on stdin, run from the repo root:
 
-Note: the `/codex` skill is read-only (review/challenge/consult). Implementation is not covered by the skill — these MCP conventions are how you stay consistent across sessions.
+```
+codex exec -C <repo-root> -o /tmp/codex_last.txt < /tmp/codex_prompt.txt > /tmp/codex_run.log 2>&1
+```
+
+- **Inherit `~/.codex/config.toml` — don't override.** Do NOT pass `-m/--model`, a reasoning-effort override, or `-s/--sandbox`. The config is the source of truth (currently `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`) and tracks model upgrades. Pass `-s workspace-write` only to *tighten* a run that must not touch anything outside the repo.
+- **Working directory:** always pass `-C <repo-root>` explicitly. (`codex exec resume` does NOT accept `-C` — `cd <repo-root> &&` before it instead.)
+- **Prompt via stdin:** write the prompt to a file and pipe it in (`< file`) — avoids arg-length/quoting hell with backticks/`$`/quotes. Always redirect stdin (`< file` or `< /dev/null`) so a background run can't block on "Reading additional input from stdin…".
+- **No hidden approval prompts:** before dispatching, `grep -c 'approval_mode = "approve"' ~/.codex/config.toml`; if > 0, flip those to `"auto"` first (an active per-tool `approve` overrides `approval_policy = "never"` and stalls the run).
+- **Long runs:** dispatch with `run_in_background: true` and arm a stall monitor (poll the log size; alert after ~4 min of no growth while the process is alive). Exit 0 ≠ task done — confirm via the `tokens used` marker + final message in the log.
+- **Don't let Codex commit:** tell it NOT to commit; verify tests + build yourself, then commit path-scoped.
+
+Note: the `/codex` skill is read-only (review/challenge/consult). Implementation is not covered by the skill — these CLI conventions are how you stay consistent across sessions.
 
 ## Don't defer to dodge friction
 
