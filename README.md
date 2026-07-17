@@ -15,7 +15,7 @@ pip install edgar-mcp
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `EDGAR_API_KEY` | yes | API key for the hosted EDGAR API. |
+| `EDGAR_API_KEY` | hosted tools | API key for the hosted EDGAR API; not used by `get_issuer_submissions_meta`. |
 | `EDGAR_API_URL` | no | Override the API base URL. Defaults to `https://www.edgarparser.com`. |
 | `EDGAR_MCP_OUTPUT_DIR` | no | Directory for `output="file"` tool responses. |
 
@@ -37,7 +37,7 @@ Claude Desktop / Claude Code config:
 
 ## Tool Inventory
 
-This package exposes 29 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
+This package exposes 30 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
 
 | Tool | Summary | Tier | Cache Behavior |
 | --- | --- | --- | --- |
@@ -48,11 +48,12 @@ This package exposes 29 public MCP tools. The inventory below is generated from 
 | `get_filing_sections` | Extract selected qualitative filing sections and optional embedded tables. | `public` | `cold_allowed` |
 | `get_filing_cover_facts` | Return exact DEI cover-page facts such as shares outstanding with citations. | `registered` | `cold_allowed` |
 | `get_filing_evidence` | Plan and retrieve citation-ready filing evidence for qualitative SEC questions. | `paid` | `llm_call` |
+| `get_issuer_submissions_meta` | Return an issuer's SEC submissions header metadata directly from the public SEC JSON endpoint. | `public` | `cold_allowed` |
 | `get_operational_kpi_drivers` | Extract non-XBRL operational KPI values and driver growth rates from filing narrative. | `paid` | `llm_call` |
 | `get_filing_extractions` | Return cached langextract spans for one filing or run paid extraction on cache miss. | `paid` | `llm_call` |
 | `search_extractions` | Search cached langextract spans across filings with structured filters. | `paid` | `cache_only` |
 | `get_extraction_series` | Return periodized counts and optional hits for cached langextract spans. | `paid` | `cache_only` |
-| `extract_filing_file` | Ingest a trusted local markdown filing and run a selected extraction schema. | `internal` | `llm_call` |
+| `extract_filing_file` | Run a selected extraction schema against trusted local markdown using scratch document handles. | `internal` | `llm_call` |
 | `list_extraction_schemas` | List document extraction schemas available to the internal document API. | `internal` | `cache_only` |
 | `get_filing_tables` | Return filing table metadata or one hydrated structured table. | `public` | `cold_allowed` |
 | `search_filing_tables` | Search cached filing table metadata across a ticker and period range. | `public` | `cache_only` |
@@ -75,7 +76,7 @@ This package exposes 29 public MCP tools. The inventory below is generated from 
 
 ### Filing Metadata and Documents
 
-`get_filings`, `get_event_filings`, `describe_filing`, `get_filing_document`, `get_filing_sections`, `get_filing_cover_facts`, `get_filing_evidence`
+`get_filings`, `get_event_filings`, `describe_filing`, `get_filing_document`, `get_filing_sections`, `get_filing_cover_facts`, `get_filing_evidence`, `get_issuer_submissions_meta`
 
 ### Operational KPIs
 
@@ -99,8 +100,8 @@ This package exposes 29 public MCP tools. The inventory below is generated from 
 
 ## Runtime Notes
 
-- This is a thin client for the hosted EDGAR API; it does not parse filings locally.
-- Missing or invalid `EDGAR_API_KEY` lets the server start, but tool calls return authentication errors.
+- This is a thin client for the hosted EDGAR API and the public SEC submissions endpoint; it does not parse filings locally.
+- Missing or invalid `EDGAR_API_KEY` lets the server start, but hosted API tool calls return authentication errors; `get_issuer_submissions_meta` does not require the key.
 - Large payload tools support `output="file"` and write to `EDGAR_MCP_OUTPUT_DIR` or a local fallback directory.
 - API rate limits and paid-tool access are enforced by the hosted service.
 
