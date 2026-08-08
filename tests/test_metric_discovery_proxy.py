@@ -8,14 +8,14 @@ def test_proxy_list_metrics_forwards_to_http_endpoint(monkeypatch):
         calls.append((path, params, timeout))
         return {
             "status": "success",
-            "metadata": {"source": {"filing_type": "10-K"}},
-            "facts": [
+            "ticker": "PCTY",
+            "date_type_filter": "FY",
+            "total_candidates": 1,
+            "returned_candidates": 1,
+            "metrics": [
                 {
                     "tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-                    "concept_label": "Revenue from Contract with Customer, Excluding Assessed Tax",
-                    "date_type": "FY",
-                    "current_period_value": 100.0,
-                    "prior_period_value": 90.0,
+                    "metric_name": "RevenueFromContractWithCustomerExcludingAssessedTax",
                 }
             ],
         }
@@ -36,19 +36,21 @@ def test_proxy_list_metrics_forwards_to_http_endpoint(monkeypatch):
     assert result["status"] == "success"
     assert calls == [
         (
-            "/api/financials",
+            "/api/financials/list_metrics",
             {
                 "ticker": "pcty",
                 "year": 2025,
                 "quarter": 4,
                 "full_year_mode": "true",
                 "source": "auto",
+                "limit": 1000,
+                "include_values": "false",
+                "date_type": "FY",
             },
             300,
         )
     ]
     assert result["metrics"][0]["metric_name"] == "RevenueFromContractWithCustomerExcludingAssessedTax"
-    assert "current_value" not in result["metrics"][0]
 
 
 def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
@@ -58,25 +60,18 @@ def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
         calls.append((path, params, timeout))
         return {
             "status": "success",
-            "metadata": {"source": {"filing_type": "10-Q"}},
-            "facts": [
+            "ticker": "PCTY",
+            "query": params["query"],
+            "total_matches": 1,
+            "matches": [
                 {
                     "tag": "us-gaap:LongTermDebtCurrent",
-                    "concept_label": "Long-Term Debt, Current",
-                    "date_type": "Q",
-                    "current_period_value": 10.0,
-                    "prior_period_value": 8.0,
-                    "presentation_role": "CONSOLIDATED BALANCE SHEETS",
-                },
-                {
-                    "tag": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-                    "concept_label": "Revenue",
-                    "date_type": "Q",
-                    "current_period_value": 100.0,
-                    "prior_period_value": 90.0,
-                    "presentation_role": "CONSOLIDATED STATEMENTS OF OPERATIONS",
+                    "metric_name": "LongTermDebtCurrent",
+                    "match_score": 100.0,
                 },
             ],
+            "low_confidence": False,
+            "confidence_reason": None,
         }
 
     monkeypatch.setattr(server, "_call_api", fake_call_api)
@@ -88,23 +83,28 @@ def test_proxy_search_metrics_forwards_to_http_endpoint(monkeypatch):
             "quarter": 3,
             "query": " debt ",
             "source": "8k",
-            "date_type": "bad-value",
+            "date_type": "Q",
             "role": ["cash-flow", "balance_sheet"],
             "limit": 150,
-            "include_values": "false",
+            "include_values": False,
         }
     )
 
     assert result["status"] == "success"
     assert calls == [
         (
-            "/api/financials",
+            "/api/financials/search_metrics",
             {
                 "ticker": "PCTY",
                 "year": 2025,
                 "quarter": 3,
+                "query": "debt",
                 "full_year_mode": "false",
                 "source": "8k",
+                "limit": 100,
+                "include_values": "false",
+                "date_type": "Q",
+                "role": "balance_sheet,cash_flow",
             },
             300,
         )
