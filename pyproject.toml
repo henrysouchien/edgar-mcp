@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edgar-mcp"
-version = "1.0.0"
-description = "MCP server for SEC EDGAR financial data with a manifest-backed 29-tool surface"
+version = "1.0.1"
+description = "MCP server for SEC EDGAR financial data with a manifest-backed 31-tool surface"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
