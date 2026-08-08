@@ -27,6 +27,9 @@ Issues = "https://github.com/henrysouchien/edgar-mcp/issues"
 [project.scripts]
 edgar-mcp = "edgar_mcp.server:main"
 
+[tool.hatch.build]
+exclude = ["/edgar_mcp/.edgar_mcp_server_*.pid"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["edgar_mcp"]
 
