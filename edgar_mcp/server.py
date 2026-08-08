@@ -15,12 +15,16 @@ _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import threading
 import time
 from contextlib import redirect_stdout
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -28,7 +32,12 @@ from typing import Annotated, Any, Literal
 
 import requests
 from fastmcp import FastMCP
+from fastmcp.server.context import Context
 from pydantic import Field
+from value_semantics_core import NumericDisplaySpec
+
+from edgar_parser.http_client import SECEgressError
+from edgar_parser.http_client import get as sec_get
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
@@ -241,6 +250,286 @@ def _get_output_dir() -> Path:
 
 FILE_OUTPUT_DIR = _get_output_dir()
 
+_FILING_ARTIFACT_KIND = "edgar.filing-markdown"
+_FILING_ARTIFACT_MEDIA_TYPE = "text/markdown"
+_ARTIFACT_HANDLE_TTL_SECONDS = 15 * 60
+_MAX_FILING_ARTIFACT_BYTES = 16 * 1024 * 1024
+_MAX_ARTIFACT_RECORDS = 64
+_MAX_ARTIFACT_REGISTRY_BYTES = 64 * 1024 * 1024
+_PROCESS_ARTIFACT_SESSION_ID = f"process:{secrets.token_urlsafe(18)}"
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedArtifactWriteReceipt:
+    root_path: str
+    root_device: int
+    root_inode: int
+    filename: str
+    file_device: int
+    file_inode: int
+    trusted_content: bytes
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactRecord:
+    handle: str
+    producer: str
+    kind: str
+    media_type: str
+    owner_id: str
+    session_id: str
+    root_path: str
+    root_device: int
+    root_inode: int
+    filename: str
+    file_device: int
+    file_inode: int
+    size: int
+    sha256: str
+    trusted_content: bytes
+    created_at: float
+    expires_at: float
+
+
+_ARTIFACT_RECORDS: dict[str, _ArtifactRecord] = {}
+_ARTIFACT_RECORDS_LOCK = threading.Lock()
+
+
+def _artifact_binding(args: dict[str, Any]) -> tuple[str, str]:
+    """Return trusted owner/session values hidden from the public tool schema."""
+    owner_id = str(
+        args.get("__artifact_owner_id")
+        or os.getenv("EDGAR_MCP_ARTIFACT_OWNER_ID", "")
+    ).strip()
+    session_id = str(
+        args.get("__artifact_session_id")
+        or os.getenv("EDGAR_MCP_ARTIFACT_SESSION_ID", "")
+        or _PROCESS_ARTIFACT_SESSION_ID
+    ).strip()
+    return owner_id, session_id
+
+
+def _context_session_id(ctx: Context) -> str:
+    try:
+        value = str(ctx.session_id or "").strip()
+    except Exception:
+        value = ""
+    return value or _PROCESS_ARTIFACT_SESSION_ID
+
+
+def _open_artifact_root(root_path: Path) -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(str(root_path), flags)
+
+
+def _read_artifact_file(
+    root_path: Path,
+    filename: str,
+) -> tuple[bytes, os.stat_result, os.stat_result]:
+    if not filename or Path(filename).name != filename:
+        raise ValueError("Artifact record contains an invalid filename")
+
+    root_fd = _open_artifact_root(root_path)
+    file_fd = -1
+    try:
+        root_stat = os.fstat(root_fd)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        file_fd = os.open(filename, flags, dir_fd=root_fd)
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("Artifact is not a regular file")
+        if file_stat.st_size > _MAX_FILING_ARTIFACT_BYTES:
+            raise ValueError("Artifact exceeds the maximum supported size")
+
+        chunks: list[bytes] = []
+        remaining = _MAX_FILING_ARTIFACT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > _MAX_FILING_ARTIFACT_BYTES:
+            raise ValueError("Artifact exceeds the maximum supported size")
+        return content, root_stat, file_stat
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(root_fd)
+
+
+def _write_trusted_artifact(path: Path, content: str) -> _TrustedArtifactWriteReceipt:
+    """Write atomically and capture immutable provenance before close/rename."""
+    root_path = FILE_OUTPUT_DIR.resolve(strict=True)
+    if path.parent != root_path or Path(path.name).name != path.name:
+        raise ValueError(
+            "Trusted artifact output must be a flat file in the EDGAR output directory"
+        )
+
+    root_fd = _open_artifact_root(root_path)
+    root_stat = os.fstat(root_fd)
+    temp_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+    temp_created = False
+    trusted_content = content.encode("utf-8")
+    if len(trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
+        os.close(root_fd)
+        raise ValueError("Artifact exceeds the maximum supported size")
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(temp_name, flags, 0o600, dir_fd=root_fd)
+        temp_created = True
+        try:
+            remaining = memoryview(trusted_content)
+            while remaining:
+                written = os.write(file_fd, remaining)
+                if written <= 0:
+                    raise OSError("Failed to write trusted artifact")
+                remaining = remaining[written:]
+            os.fsync(file_fd)
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("Trusted artifact output is not a regular file")
+            if file_stat.st_size != len(trusted_content):
+                raise ValueError("Trusted artifact write size did not match producer bytes")
+            receipt = _TrustedArtifactWriteReceipt(
+                root_path=str(root_path),
+                root_device=root_stat.st_dev,
+                root_inode=root_stat.st_ino,
+                filename=path.name,
+                file_device=file_stat.st_dev,
+                file_inode=file_stat.st_ino,
+                trusted_content=trusted_content,
+                sha256=hashlib.sha256(trusted_content).hexdigest(),
+            )
+        finally:
+            os.close(file_fd)
+        os.replace(temp_name, path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        temp_created = False
+        return receipt
+    finally:
+        if temp_created:
+            try:
+                os.unlink(temp_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+        os.close(root_fd)
+
+
+def _issue_artifact_handle(
+    receipt: _TrustedArtifactWriteReceipt,
+    *,
+    producer: str,
+    kind: str,
+    media_type: str,
+    owner_id: str,
+    session_id: str,
+    ttl_seconds: int = _ARTIFACT_HANDLE_TTL_SECONDS,
+) -> _ArtifactRecord:
+    if len(receipt.trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
+        raise ValueError("Artifact exceeds the maximum supported size")
+    if len(receipt.trusted_content) > _MAX_ARTIFACT_REGISTRY_BYTES:
+        raise ValueError("Artifact exceeds the in-memory registry capacity")
+    now = time.time()
+    handle = f"edgar_artifact_{secrets.token_urlsafe(32)}"
+    record = _ArtifactRecord(
+        handle=handle,
+        producer=producer,
+        kind=kind,
+        media_type=media_type,
+        owner_id=owner_id,
+        session_id=session_id,
+        root_path=receipt.root_path,
+        root_device=receipt.root_device,
+        root_inode=receipt.root_inode,
+        filename=receipt.filename,
+        file_device=receipt.file_device,
+        file_inode=receipt.file_inode,
+        size=len(receipt.trusted_content),
+        sha256=receipt.sha256,
+        trusted_content=receipt.trusted_content,
+        created_at=now,
+        expires_at=now + max(1, int(ttl_seconds)),
+    )
+    with _ARTIFACT_RECORDS_LOCK:
+        expired = [key for key, value in _ARTIFACT_RECORDS.items() if value.expires_at <= now]
+        for key in expired:
+            _ARTIFACT_RECORDS.pop(key, None)
+        registry_bytes = sum(value.size for value in _ARTIFACT_RECORDS.values())
+        while _ARTIFACT_RECORDS and (
+            len(_ARTIFACT_RECORDS) >= _MAX_ARTIFACT_RECORDS
+            or registry_bytes + record.size > _MAX_ARTIFACT_REGISTRY_BYTES
+        ):
+            oldest_handle, oldest_record = min(
+                _ARTIFACT_RECORDS.items(),
+                key=lambda item: item[1].created_at,
+            )
+            _ARTIFACT_RECORDS.pop(oldest_handle, None)
+            registry_bytes -= oldest_record.size
+        _ARTIFACT_RECORDS[handle] = record
+    return record
+
+
+def _resolve_artifact_handle(
+    handle: str,
+    *,
+    expected_producer: str,
+    expected_kind: str,
+    expected_media_type: str,
+    owner_id: str,
+    session_id: str,
+) -> tuple[_ArtifactRecord, bytes]:
+    normalized = str(handle or "").strip()
+    if not normalized:
+        raise ValueError("artifact_handle is required; local file paths are not accepted")
+    now = time.time()
+    with _ARTIFACT_RECORDS_LOCK:
+        record = _ARTIFACT_RECORDS.get(normalized)
+        if record is None:
+            raise ValueError("Artifact handle is unknown or was not issued by this Edgar producer")
+        if record.expires_at <= now:
+            _ARTIFACT_RECORDS.pop(normalized, None)
+            raise ValueError("Artifact handle has expired")
+
+    if record.owner_id != owner_id or record.session_id != session_id:
+        raise ValueError("Artifact handle is not valid for this owner/session")
+    if record.producer != expected_producer:
+        raise ValueError("Artifact handle was issued by the wrong producer")
+    if record.kind != expected_kind or record.media_type != expected_media_type:
+        raise ValueError("Artifact handle has the wrong kind or media type")
+
+    try:
+        observed_content, root_stat, file_stat = _read_artifact_file(
+            Path(record.root_path),
+            record.filename,
+        )
+    except OSError as exc:
+        raise ValueError("Artifact could not be opened without following links") from exc
+    if (root_stat.st_dev, root_stat.st_ino) != (record.root_device, record.root_inode):
+        raise ValueError("Artifact output directory identity changed after issuance")
+    if (file_stat.st_dev, file_stat.st_ino) != (record.file_device, record.file_inode):
+        raise ValueError("Artifact file identity changed after issuance")
+    if (
+        len(observed_content) != record.size
+        or hashlib.sha256(observed_content).hexdigest() != record.sha256
+    ):
+        raise ValueError("Artifact content changed after issuance")
+    if time.time() >= record.expires_at:
+        with _ARTIFACT_RECORDS_LOCK:
+            _ARTIFACT_RECORDS.pop(normalized, None)
+        raise ValueError("Artifact handle has expired")
+    return record, record.trusted_content
+
 ExtractionPeriod = Annotated[
     str,
     Field(
@@ -335,10 +624,6 @@ mcp = FastMCP(
 # Remote API helpers
 # ---------------------------------------------------------------------------
 
-_SEC_SUBMISSIONS_USER_AGENT = "edgar-parser henry@edgarparser.com"
-_SEC_SUBMISSIONS_THROTTLE_LOCK = threading.Lock()
-_SEC_SUBMISSIONS_LAST_CALL_MONOTONIC: float | None = None
-
 def _get_api_config():
     base_url = os.getenv("EDGAR_API_URL", "https://www.edgarparser.com").rstrip("/")
     api_key = os.getenv("EDGAR_API_KEY", "")
@@ -387,20 +672,8 @@ def _get_issuer_submissions_meta_impl(args: dict) -> dict:
     url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
 
     try:
-        global _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC
-        with _SEC_SUBMISSIONS_THROTTLE_LOCK:
-            now = time.monotonic()
-            if _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC is not None:
-                delay = 1.0 - (now - _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC)
-                if delay > 0:
-                    time.sleep(delay)
-            _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC = time.monotonic()
-            response = requests.get(
-                url,
-                timeout=30,
-                headers={"User-Agent": _SEC_SUBMISSIONS_USER_AGENT},
-            )
-    except requests.RequestException as exc:
+        response = sec_get(url, caller_label=__name__, timeout=30)
+    except (requests.RequestException, SECEgressError) as exc:
         return {
             "status": "error",
             "message": f"SEC submissions request failed: {exc}",
@@ -758,12 +1031,22 @@ _OPERATIONAL_DRIVER_METRICS: tuple[dict[str, Any], ...] = (
     {
         "canonical": "Gross Bookings",
         "aliases": ("gross bookings", "gross booking", "bookings"),
-        "unit": "USD millions",
+        "display": {
+            "numeric_kind": "currency",
+            "scale": "millions",
+            "currency": "USD",
+            "precision": 0,
+        },
     },
     {
         "canonical": "Revenue",
         "aliases": ("revenue", "revenues", "sales"),
-        "unit": "USD millions",
+        "display": {
+            "numeric_kind": "currency",
+            "scale": "millions",
+            "currency": "USD",
+            "precision": 0,
+        },
     },
 )
 
@@ -907,7 +1190,7 @@ def _make_operational_metric(
     *,
     match_source: str,
     score: int = 0,
-    unit: str | None = None,
+    display: dict[str, Any] | None = None,
     aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     metric: dict[str, Any] = {
@@ -916,8 +1199,8 @@ def _make_operational_metric(
         "match_source": match_source,
         "match_score": score,
     }
-    if unit:
-        metric["unit"] = unit
+    if display:
+        metric["display"] = _validated_display(display)
     return metric
 
 
@@ -1021,11 +1304,44 @@ def _operational_scale_from_raw(raw: object) -> str | None:
     return None
 
 
-def _operational_unit_from_raw(raw: object, fallback: str | None = None) -> str:
-    if "$" in str(raw or ""):
-        scale = _operational_scale_from_raw(raw)
-        return f"USD {scale}" if scale else "USD"
-    return fallback or "reported filing units"
+def _validated_display(display: dict[str, Any]) -> dict[str, Any]:
+    return NumericDisplaySpec.model_validate(display).model_dump(exclude_none=True)
+
+
+def _operational_display(
+    raw: object,
+    *,
+    fallback: dict[str, Any] | None = None,
+    unit_label: str | None = None,
+) -> dict[str, Any]:
+    raw_text = str(raw or "")
+    scale = _operational_scale_from_raw(raw)
+    fallback_scale = (fallback or {}).get("scale")
+    precision = _operational_decimal_precision(raw)
+    if "$" in raw_text:
+        return _validated_display(
+            {
+                "numeric_kind": "currency",
+                "scale": scale or fallback_scale or "unit",
+                "currency": "USD",
+                "precision": precision,
+            }
+        )
+    if fallback:
+        return _validated_display({**fallback, "precision": precision})
+    return _validated_display(
+        {
+            "numeric_kind": "count",
+            "scale": scale or "unit",
+            "precision": precision,
+            **({"unit_label": unit_label} if unit_label else {}),
+        }
+    )
+
+
+def _operational_decimal_precision(raw: object) -> int:
+    match = re.search(r"-?\d[\d,]*\.(\d+)", str(raw or ""))
+    return min(len(match.group(1)), 8) if match else 0
 
 
 def _parse_operational_percent(raw: object, verb: object = "") -> float | None:
@@ -1190,9 +1506,14 @@ def _append_growth_row(
         "period": period,
         "basis": basis,
         "value": value_percent / 100.0,
-        "value_percent": value_percent,
         "value_raw": value_raw or f"{value_percent:g}%",
         "value_semantic": "growth_rate",
+        "display": _validated_display(
+            {
+                "numeric_kind": "percentage",
+                "precision": _operational_decimal_precision(value_raw or f"{value_percent:g}%"),
+            }
+        ),
         "source_basis": source_basis,
         "precision": precision or _operational_precision(value_raw or f"{value_percent:g}%", source_basis=source_basis),
         "recommended_for_calculation": recommended_for_calculation,
@@ -1431,8 +1752,6 @@ def _narrative_change_amount_for_metric(
     return {
         "value": value,
         "value_raw": raw,
-        "unit": _operational_unit_from_raw(raw),
-        "scale": _operational_scale_from_raw(raw),
         "precision": _operational_precision(raw, source_basis="narrative_change_amount"),
     }
 
@@ -1491,8 +1810,6 @@ def _iter_operational_narrative_amount_years(text: str) -> list[dict[str, Any]]:
                 "value": value,
                 "value_raw": raw,
                 "period": f"FY{int(match.group('year'))}",
-                "unit": _operational_unit_from_raw(raw, fallback="reported filing units"),
-                "scale": _operational_scale_from_raw(raw),
                 "precision": _operational_precision(raw, source_basis="narrative_reported"),
                 "amount_role": "metric_value",
                 "start": match.start(),
@@ -1547,8 +1864,11 @@ def _extract_operational_value_rows_from_prose(
                     "value": amount["value"],
                     "value_raw": amount["value_raw"],
                     "value_semantic": "period_absolute_value",
-                    "unit": amount["unit"],
-                    "scale": amount["scale"],
+                    "display": _operational_display(
+                        amount["value_raw"],
+                        fallback=mention["metric"].get("display"),
+                        unit_label=_normalized_operational_table_label(mention["metric_name"]),
+                    ),
                     "source_basis": "narrative_reported",
                     "precision": amount["precision"],
                     "recommended_for_calculation": False,
@@ -1630,8 +1950,11 @@ def _extract_operational_growth_rows_from_prose(
                         "value": change_amount["value"],
                         "value_raw": change_amount["value_raw"],
                         "value_semantic": "change_amount",
-                        "unit": change_amount["unit"],
-                        "scale": change_amount["scale"],
+                        "display": _operational_display(
+                            change_amount["value_raw"],
+                            fallback=mention["metric"].get("display"),
+                            unit_label=_normalized_operational_table_label(mention["metric_name"]),
+                        ),
                         "source_basis": "narrative_change_amount",
                         "precision": change_amount["precision"],
                         "recommended_for_calculation": False,
@@ -1720,6 +2043,10 @@ def _iter_operational_pipe_table_rows(text: str) -> list[tuple[int, int, str, li
     for block in _iter_operational_pipe_table_blocks(text):
         rows.extend(block["rows"])
     return rows
+
+
+def _operational_table_block_scale(block: dict[str, Any]) -> str | None:
+    return _operational_scale_from_raw(" ".join(str(line) for line in block.get("lines", [])))
 
 
 def _operational_table_label_allowed(label: object) -> bool:
@@ -2220,7 +2547,20 @@ def _discover_table_operational_metrics(text: str, topic: object) -> list[dict[s
                     label,
                     match_source="filing_table_label",
                     score=score or 40,
-                    unit="USD millions" if "$" in line else "reported filing units",
+                    display=_operational_display(
+                        line,
+                        fallback={
+                            "numeric_kind": "currency" if "$" in line else "count",
+                            "scale": _operational_table_block_scale(block) or "unit",
+                            **({"currency": "USD"} if "$" in line else {}),
+                            **(
+                                {}
+                                if "$" in line
+                                else {"unit_label": _normalized_operational_table_label(label)}
+                            ),
+                            "precision": 0,
+                        },
+                    ),
                 )
             )
     return sorted(discovered, key=lambda item: int(item.get("match_score", 0)), reverse=True)
@@ -2330,7 +2670,11 @@ def _extract_operational_rows_from_pipe_tables(
                         "value": item["value"],
                         "value_raw": item["value_raw"],
                         "value_semantic": "period_absolute_value",
-                        "unit": matched_metric.get("unit") or ("USD millions" if "$" in line else "reported filing units"),
+                        "display": _operational_display(
+                            item["value_raw"],
+                            fallback=matched_metric.get("display"),
+                            unit_label=_normalized_operational_table_label(metric_name),
+                        ),
                         "source_basis": "table_reported",
                         "precision": item["precision"],
                         "recommended_for_calculation": True,
@@ -2373,7 +2717,7 @@ def _extract_operational_rows_from_pipe_tables(
 
 
 def _operational_row_numeric_value(row: dict[str, Any]) -> float | None:
-    metric_value = row.get("value_percent") if row.get("kind") == "growth_rate" else row.get("value")
+    metric_value = row.get("value")
     return metric_value if isinstance(metric_value, float | int) else None
 
 
@@ -3187,10 +3531,8 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         filename = f"{ticker}_{quarter}Q{year % 100:02d}{source_suffix}_{keys_part}.md"
     else:
         filename = f"{ticker}_{quarter}Q{year % 100:02d}{source_suffix}_sections.md"
-    file_path = (FILE_OUTPUT_DIR / filename).resolve()
     root_dir = FILE_OUTPUT_DIR.resolve()
-    if not file_path.is_relative_to(root_dir):
-        return {"status": "error", "message": "Invalid output path"}
+    file_path = root_dir / filename
     if _deadline_expired(args):
         return {"status": "error", "message": "Request timed out before file output could be written"}
 
@@ -3230,7 +3572,19 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     if lines and lines[-1] == "---":
         lines.pop()
 
-    file_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    write_receipt = _write_trusted_artifact(
+        file_path,
+        "\n".join(lines).strip() + "\n",
+    )
+    owner_id, session_id = _artifact_binding(args)
+    artifact_record = _issue_artifact_handle(
+        write_receipt,
+        producer="get_filing_sections",
+        kind=_FILING_ARTIFACT_KIND,
+        media_type=_FILING_ARTIFACT_MEDIA_TYPE,
+        owner_id=owner_id,
+        session_id=session_id,
+    )
 
     tables_file_path: Path | None = None
     if include_tables:
@@ -3271,7 +3625,14 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         "quarter": quarter,
         "filing_type": filing_type,
         "output": "file",
-        "file_path": str(file_path.resolve()),
+        "file_path": str(file_path),
+        "artifact_handle": artifact_record.handle,
+        "artifact_kind": artifact_record.kind,
+        "artifact_media_type": artifact_record.media_type,
+        "artifact_expires_at": datetime.fromtimestamp(
+            artifact_record.expires_at,
+            tz=UTC,
+        ).isoformat(),
         "hint": "Use Read tool with file_path. Grep '^## SECTION:' for anchors.",
         "sections": summary_sections,
         **aggregates,
@@ -3282,6 +3643,33 @@ def _proxy_get_filing_sections(args: dict) -> dict:
             "section_count": len(sections_data),
         },
     }
+    filing_identity = result.get("filing")
+    if isinstance(filing_identity, dict):
+        response["filing"] = dict(filing_identity)
+        for response_key, filing_keys in {
+            "accession": ("accession",),
+            "cik": ("cik",),
+            "form": ("form_type", "form"),
+        }.items():
+            value = next(
+                (
+                    filing_identity.get(filing_key)
+                    for filing_key in filing_keys
+                    if filing_identity.get(filing_key) is not None
+                ),
+                None,
+            )
+            if value is not None:
+                response[response_key] = value
+    for provenance_key in (
+        "parser_version",
+        "parser_schema_version",
+        "producer_build_id",
+        "producer_deployment_id",
+        "producer_instance_id",
+    ):
+        if result.get(provenance_key) is not None:
+            response[provenance_key] = result[provenance_key]
     if "result_status" in result:
         response["result_status"] = result["result_status"]
     if "result_message" in result:
@@ -3399,6 +3787,25 @@ def _annotate_filing_document_section_error(response: dict) -> dict:
     return enriched
 
 
+def _proxy_get_operational_kpi_driver_rows(args: dict) -> dict:
+    """Return the producer-owned operational-KPI DTO without reinterpretation."""
+    source = _normalize_agent_source_arg(args.get("source"))
+    if source not in _AGENT_SOURCES:
+        return {"status": "error", "message": _AGENT_SOURCE_ERROR}
+
+    params: dict[str, Any] = {
+        "ticker": args["ticker"],
+        "year": args["year"],
+        "quarter": args["quarter"],
+        "source": source,
+        "filter_to_topic": bool(args.get("filter_to_topic", False)),
+        "include_non_numeric": bool(args.get("include_non_numeric", False)),
+    }
+    if args.get("topic") is not None:
+        params["topic"] = args["topic"]
+    return _call_api("/api/operational-kpis/drivers", params, timeout=300)
+
+
 def _proxy_get_operational_kpi_drivers(args: dict) -> dict:
     source = _normalize_agent_source_arg(args.get("source"))
     if source not in _AGENT_SOURCES:
@@ -3464,7 +3871,7 @@ def _proxy_get_operational_kpi_drivers(args: dict) -> dict:
         "metric_candidates": [
             {
                 key: metric.get(key)
-                for key in ("canonical", "match_source", "match_score", "unit")
+                for key in ("canonical", "match_source", "match_score", "display")
                 if key in metric
             }
             for metric in metrics
@@ -3537,18 +3944,34 @@ def _proxy_get_filing_evidence(args: dict) -> dict:
 
 
 def _proxy_extract_filing_file(args: dict) -> dict:
+    owner_id, session_id = _artifact_binding(args)
     try:
-        resolved_path = validate_file_path(args["file_path"])
+        record, original_bytes = _resolve_artifact_handle(
+            str(args.get("artifact_handle") or ""),
+            expected_producer="get_filing_sections",
+            expected_kind=_FILING_ARTIFACT_KIND,
+            expected_media_type=_FILING_ARTIFACT_MEDIA_TYPE,
+            owner_id=owner_id,
+            session_id=session_id,
+        )
     except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+        return {
+            "status": "error",
+            "error_type": "invalid_artifact_handle",
+            "message": str(exc),
+        }
 
     if _deadline_expired(args):
         return {"status": "error", "message": "Request timed out before the filing could be read"}
 
     try:
-        original_text = Path(resolved_path).read_text(encoding="utf-8")
-    except Exception as exc:
-        return {"status": "error", "message": f"Failed to read filing file: {exc}"}
+        original_text = original_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "status": "error",
+            "error_type": "invalid_artifact_content",
+            "message": "Issued filing artifact is not valid UTF-8 markdown",
+        }
 
     section_headers = _list_filing_section_headers(original_text)
     requested_filters = [
@@ -3591,7 +4014,7 @@ def _proxy_extract_filing_file(args: dict) -> dict:
             "/api/documents/scratch-extract",
             {
                 "content": original_text,
-                "source_name": Path(resolved_path).name,
+                "source_name": record.filename,
                 "section": section_name,
                 "schemas": [schema_name],
             },
@@ -3619,7 +4042,10 @@ def _proxy_extract_filing_file(args: dict) -> dict:
         "scratch_source_id": scratch_source_id,
         "request_document_handle": request_document_handle or scratch_source_id,
         "schema_used": schema_name,
-        "file_path": resolved_path,
+        "artifact_handle": record.handle,
+        "artifact_kind": record.kind,
+        "artifact_media_type": record.media_type,
+        "artifact_producer": record.producer,
         "sections_processed": sections_processed,
         "grounded_count": grounded_count,
         "total_count": len(normalized),
@@ -3798,6 +4224,7 @@ _TOOL_DISPATCH = {
     "get_filing_sections": _proxy_get_filing_sections,
     "get_filing_document": _proxy_get_filing_document,
     "get_filing_cover_facts": _proxy_get_filing_cover_facts,
+    "get_operational_kpi_driver_rows": _proxy_get_operational_kpi_driver_rows,
     "get_operational_kpi_drivers": _proxy_get_operational_kpi_drivers,
     "search_filing_text": _proxy_search_filing_text,
     "get_filing_evidence": _proxy_get_filing_evidence,
@@ -3831,6 +4258,7 @@ _TOOL_TIMEOUT = {
     "get_filing_sections": 300,
     "get_filing_document": 120,
     "get_filing_cover_facts": 120,
+    "get_operational_kpi_driver_rows": 300,
     "get_operational_kpi_drivers": 120,
     "search_filing_text": 60,
     "get_filing_evidence": 120,
@@ -3993,10 +4421,10 @@ async def get_financials(
     call this tool once per target fiscal period, or use get_statement range
     mode when a bulk template-backed statement is acceptable. Returns structured
     JSON with income statement, balance sheet, and cash flow data. If returned,
-    `scope_warnings` flag mixed-scope cash-flow facts and `scope_bridges`
-    provide evidence-backed adjustment candidates; for FCF margin/trend work,
-    show reported values and use bridge candidates only as normalized/same-scope
-    views.
+    `scope_warnings` flag mixed-scope cash-flow facts. `scope_bridges` are returned
+    only when distinct, period-aligned continuing- or discontinued-operations CFO
+    facts support a same-scope candidate; otherwise the warning reports
+    `bridge_status="unavailable"` and the raw filing facts remain authoritative.
     """
     return await _run_tool_guarded(
         "get_financials",
@@ -4051,7 +4479,9 @@ async def get_metric(
     `scope_bridges`; treat bridges as adjustment candidates for same-scope
     analysis, not replacements for reported facts. Filing-native operational KPI
     misses include a remediation hint for get_operational_kpi_drivers when the
-    name looks like a non-XBRL operating metric.
+    name looks like a non-XBRL operating metric. Scope bridges require direct,
+    period-aligned CFO-scope facts; component-level wind-down or working-capital
+    facts remain evidence and do not create calculated continuing-operations CFO.
 
     Discovery: call list_metrics or search_metrics for the same ticker, year,
     quarter, source, and date_type before choosing metric_name. Use get_metric
@@ -4280,8 +4710,10 @@ async def get_metric_series(
     per period before the best match is selected. Pass `axis_key` exactly as
     returned by search_metrics/list_metrics when the user needs a dimensional
     fact such as product revenue. For FCF, FCF margin, cash conversion, or trend
-    questions, inspect per-period `scope_warnings` and `scope_bridges`; if
-    bridges exist, present raw and same-scope trends.
+    questions, inspect per-period `scope_warnings` and `scope_bridges`. Bridges
+    require direct, period-aligned CFO-scope facts; when a warning instead reports
+    `bridge_status="unavailable"`, present the raw trend and underlying evidence
+    without manufacturing a same-scope value.
 
     `metric_name` must be an exact discovered metric name, not a natural-language
     description. If the metric label came from the user, a filing heading, or your
@@ -4449,6 +4881,8 @@ async def get_filing_sections(
     tables_only: bool = False,
     fallback: bool = False,
     output: Literal["inline", "file"] = "file",
+    *,
+    ctx: Context,
 ) -> dict:
     """
     Parse qualitative sections from one filing resolved by ticker/year/quarter.
@@ -4487,6 +4921,7 @@ async def get_filing_sections(
         args["sections"] = sections
     if source is not None:
         args["source"] = source
+    args["__artifact_session_id"] = _context_session_id(ctx)
     return await _run_tool_guarded("get_filing_sections", args)
 
 
@@ -4602,6 +5037,45 @@ async def get_filing_document(
 
 
 @mcp.tool()
+async def get_operational_kpi_driver_rows(
+    ticker: str,
+    year: int,
+    quarter: int,
+    source: _FILING_SOURCES = "auto",
+    topic: str | None = None,
+    filter_to_topic: bool = False,
+    include_non_numeric: bool = False,
+) -> dict:
+    """
+    Return the strict producer-owned operational-KPI driver row DTO from
+    `/api/operational-kpis/drivers`. Use these versioned, calculation-ready
+    rows for programmatic consumers and cross-transport interoperability.
+
+    `topic` optionally scores rows against a requested metric. Set
+    `filter_to_topic=true` to exclude rows with no positive topic match.
+    `include_non_numeric` preserves explicitly non-numeric observations when
+    the producer has them. The MCP transport returns the HTTP data payload
+    unchanged and does not infer missing semantic fields.
+
+    For exploratory filing research that needs narrative change amounts,
+    constant-currency driver commentary, or filing-local label discovery, use
+    `get_operational_kpi_drivers`; that distinct research tool is not a mirror
+    of this DTO.
+    """
+    args: dict[str, Any] = {
+        "ticker": ticker,
+        "year": year,
+        "quarter": quarter,
+        "source": source,
+        "filter_to_topic": filter_to_topic,
+        "include_non_numeric": include_non_numeric,
+    }
+    if topic is not None:
+        args["topic"] = topic
+    return await _run_tool_guarded("get_operational_kpi_driver_rows", args)
+
+
+@mcp.tool()
 async def get_operational_kpi_drivers(
     ticker: str,
     year: int,
@@ -4618,7 +5092,9 @@ async def get_operational_kpi_drivers(
     bridges, take-rate inputs, segment growth rates, constant-currency growth,
     and volume-vs-price decomposition. It discovers candidate labels from the
     filing document and returns citation-ready rows with snippets; it does not
-    run the slower generic KPI catalog extractor.
+    run the slower generic KPI catalog extractor. For the strict producer-owned
+    operational-KPI row DTO mirrored from HTTP, use
+    get_operational_kpi_driver_rows instead.
     """
     args: dict[str, Any] = {
         "ticker": ticker,
@@ -4942,23 +5418,26 @@ async def compare_filing_tables(
 
 @mcp.tool()
 async def extract_filing_file(
-    file_path: str,
+    artifact_handle: str,
     schema_name: str,
     sections_filter: list[str] | None = None,
+    *,
+    ctx: Context,
 ) -> dict:
     """
-    Validate a local filing markdown path and run scratch extraction for the
-    requested schema via /api/documents/scratch-extract, without creating a
-    canonical filing identity.
+    Resolve a short-lived artifact handle issued by get_filing_sections and run
+    scratch extraction for the requested schema via
+    /api/documents/scratch-extract, without creating a canonical filing
+    identity.
 
-    Discovery: choose schema_name from list_extraction_schemas. file_path should
-    be an existing local markdown filing path produced by get_filing_document
-    output=file or another trusted local export; paths outside the allowed
-    output area are rejected.
+    Discovery: choose schema_name from list_extraction_schemas and pass the
+    artifact_handle returned by get_filing_sections(output="file"). Local file
+    paths and unregistered bytes are never accepted.
     """
     args = {
-        "file_path": file_path,
+        "artifact_handle": artifact_handle,
         "schema_name": schema_name,
+        "__artifact_session_id": _context_session_id(ctx),
     }
     if sections_filter:
         args["sections_filter"] = sections_filter

@@ -37,7 +37,7 @@ Claude Desktop / Claude Code config:
 
 ## Tool Inventory
 
-This package exposes 30 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
+This package exposes 31 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
 
 | Tool | Summary | Tier | Cache Behavior |
 | --- | --- | --- | --- |
@@ -49,11 +49,12 @@ This package exposes 30 public MCP tools. The inventory below is generated from 
 | `get_filing_cover_facts` | Return exact DEI cover-page facts such as shares outstanding with citations. | `registered` | `cold_allowed` |
 | `get_filing_evidence` | Plan and retrieve citation-ready filing evidence for qualitative SEC questions. | `paid` | `llm_call` |
 | `get_issuer_submissions_meta` | Return an issuer's SEC submissions header metadata directly from the public SEC JSON endpoint. | `public` | `cold_allowed` |
-| `get_operational_kpi_drivers` | Extract non-XBRL operational KPI values and driver growth rates from filing narrative. | `paid` | `llm_call` |
+| `get_operational_kpi_drivers` | Research filing narrative and markdown tables for operational KPI values and driver context. | `paid` | `llm_call` |
+| `get_operational_kpi_driver_rows` | Return the strict producer-owned operational KPI driver row DTO without transport reinterpretation. | `paid` | `cold_allowed` |
 | `get_filing_extractions` | Return cached langextract spans for one filing or run paid extraction on cache miss. | `paid` | `llm_call` |
 | `search_extractions` | Search cached langextract spans across filings with structured filters. | `paid` | `cache_only` |
 | `get_extraction_series` | Return periodized counts and optional hits for cached langextract spans. | `paid` | `cache_only` |
-| `extract_filing_file` | Run a selected extraction schema against trusted local markdown using scratch document handles. | `internal` | `llm_call` |
+| `extract_filing_file` | Run a selected extraction schema against a short-lived filing artifact issued by get_filing_sections. | `internal` | `llm_call` |
 | `list_extraction_schemas` | List document extraction schemas available to the internal document API. | `internal` | `cache_only` |
 | `get_filing_tables` | Return filing table metadata or one hydrated structured table. | `public` | `cold_allowed` |
 | `search_filing_tables` | Search cached filing table metadata across a ticker and period range. | `public` | `cache_only` |
@@ -80,7 +81,7 @@ This package exposes 30 public MCP tools. The inventory below is generated from 
 
 ### Operational KPIs
 
-`get_operational_kpi_drivers`
+`get_operational_kpi_drivers`, `get_operational_kpi_driver_rows`
 
 ### LangExtract
 
