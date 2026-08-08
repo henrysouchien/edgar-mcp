@@ -34,10 +34,6 @@ import requests
 from fastmcp import FastMCP
 from fastmcp.server.context import Context
 from pydantic import Field
-from value_semantics_core import NumericDisplaySpec
-
-from edgar_parser.http_client import SECEgressError
-from edgar_parser.http_client import get as sec_get
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
@@ -624,6 +620,10 @@ mcp = FastMCP(
 # Remote API helpers
 # ---------------------------------------------------------------------------
 
+_SEC_SUBMISSIONS_USER_AGENT = "edgar-parser henry@edgarparser.com"
+_SEC_SUBMISSIONS_THROTTLE_LOCK = threading.Lock()
+_SEC_SUBMISSIONS_LAST_CALL_MONOTONIC: float | None = None
+
 def _get_api_config():
     base_url = os.getenv("EDGAR_API_URL", "https://www.edgarparser.com").rstrip("/")
     api_key = os.getenv("EDGAR_API_KEY", "")
@@ -672,8 +672,20 @@ def _get_issuer_submissions_meta_impl(args: dict) -> dict:
     url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
 
     try:
-        response = sec_get(url, caller_label=__name__, timeout=30)
-    except (requests.RequestException, SECEgressError) as exc:
+        global _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC
+        with _SEC_SUBMISSIONS_THROTTLE_LOCK:
+            now = time.monotonic()
+            if _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC is not None:
+                delay = 1.0 - (now - _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC)
+                if delay > 0:
+                    time.sleep(delay)
+            _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC = time.monotonic()
+            response = requests.get(
+                url,
+                timeout=30,
+                headers={"User-Agent": _SEC_SUBMISSIONS_USER_AGENT},
+            )
+    except requests.RequestException as exc:
         return {
             "status": "error",
             "message": f"SEC submissions request failed: {exc}",
@@ -1305,7 +1317,57 @@ def _operational_scale_from_raw(raw: object) -> str | None:
 
 
 def _validated_display(display: dict[str, Any]) -> dict[str, Any]:
-    return NumericDisplaySpec.model_validate(display).model_dump(exclude_none=True)
+    """Validate the bounded display hints emitted by the research-only tool.
+
+    The calculation-authoritative MCP surface is a byte-for-byte proxy of the
+    hosted API's shared value-semantics DTO.  This helper is intentionally
+    self-contained because the public ``edgar-mcp`` wheel must not import
+    monorepo-only packages; it validates only the small presentation-hint
+    vocabulary constructed in this module.
+    """
+    allowed_keys = {
+        "numeric_kind",
+        "scale",
+        "currency",
+        "denominator_basis",
+        "precision",
+        "unit_label",
+    }
+    unexpected = set(display) - allowed_keys
+    if unexpected:
+        raise ValueError(f"unsupported display fields: {sorted(unexpected)}")
+
+    result = {key: value for key, value in display.items() if value is not None}
+    numeric_kind = result.get("numeric_kind")
+    if numeric_kind not in {"currency", "percentage", "count"}:
+        raise ValueError(f"unsupported research display kind: {numeric_kind!r}")
+    if result.get("scale", "unit") not in {"unit", "thousands", "millions", "billions"}:
+        raise ValueError(f"unsupported research display scale: {result.get('scale')!r}")
+    result.setdefault("scale", "unit")
+
+    precision = result.get("precision", 1)
+    if isinstance(precision, bool) or not isinstance(precision, int) or not 0 <= precision <= 8:
+        raise ValueError("research display precision must be an integer from 0 through 8")
+    result.setdefault("precision", 1)
+
+    currency = result.get("currency")
+    if numeric_kind == "currency":
+        if currency != "USD":
+            raise ValueError("research currency display currently supports USD only")
+    elif currency is not None:
+        raise ValueError("non-currency research display must not declare currency")
+
+    if result.get("denominator_basis") is not None:
+        raise ValueError("research display does not emit denominator_basis")
+    unit_label = result.get("unit_label")
+    if unit_label is not None:
+        if not isinstance(unit_label, str) or not unit_label.strip():
+            raise ValueError("research display unit_label must be a non-empty string")
+        if any(ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F for character in unit_label):
+            raise ValueError("research display unit_label must not contain control characters")
+        if numeric_kind == "percentage":
+            raise ValueError("percentage research display must not declare unit_label")
+    return result
 
 
 def _operational_display(
