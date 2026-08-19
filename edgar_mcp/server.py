@@ -3572,14 +3572,16 @@ def _proxy_get_financials(args: dict) -> dict:
 
     FILE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{ticker}_{quarter}Q{year % 100:02d}_financials.json"
-    file_path = (FILE_OUTPUT_DIR / filename).resolve()
-    root_dir = FILE_OUTPUT_DIR.resolve()
-    if not file_path.is_relative_to(root_dir):
-        return {"status": "error", "message": "Invalid output path"}
+    root_dir = FILE_OUTPUT_DIR.resolve(strict=True)
+    file_path = root_dir / filename
     if _deadline_expired(args):
         return {"status": "error", "message": "Request timed out before file output could be written"}
 
-    file_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    atomic_write_flat_file(
+        root_dir,
+        filename,
+        json.dumps(result, indent=2, default=str).encode("utf-8"),
+    )
 
     facts = result.get("facts", []) if isinstance(result.get("facts"), list) else []
 
@@ -4100,12 +4102,14 @@ def _proxy_get_filing_sections(args: dict) -> dict:
             tables_filename = f"{file_path.name[:-len('_sections.md')]}_tables.json"
         else:
             tables_filename = f"{file_path.stem}_tables.json"
-        tables_file_path = (FILE_OUTPUT_DIR / tables_filename).resolve()
-        if not tables_file_path.is_relative_to(root_dir):
-            return {"status": "error", "message": "Invalid structured tables output path"}
+        tables_file_path = root_dir / tables_filename
         if _deadline_expired(args):
             return {"status": "error", "message": "Request timed out before structured tables could be written"}
-        tables_file_path.write_text(json.dumps(tables_structured, indent=2), encoding="utf-8")
+        atomic_write_flat_file(
+            root_dir,
+            tables_filename,
+            json.dumps(tables_structured, indent=2).encode("utf-8"),
+        )
 
     try:
         artifact_record = _issue_artifact_handle(

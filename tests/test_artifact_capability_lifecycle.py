@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -104,6 +105,15 @@ def test_public_tool_schema_has_bearer_handle_without_transport_session(
     assert "_ARTIFACT_RECORDS: dict" not in source
     assert "_artifact_binding" not in source
     assert "__artifact_session_id" not in source
+
+
+def test_product_file_routes_use_shared_atomic_writer() -> None:
+    from edgar_mcp import server
+
+    for proxy in (server._proxy_get_financials, server._proxy_get_filing_sections):
+        source = inspect.getsource(proxy)
+        assert ".write_text(" not in source
+        assert "atomic_write_flat_file(" in source
 
 
 def test_store_persists_only_bearer_digest_and_private_snapshot(
@@ -292,6 +302,7 @@ def test_sections_timeout_before_tables_write_does_not_issue_hidden_handle(
     }
     assert not _database(module, tmp_path).exists()
     assert list(tmp_path.rglob(".artifact-*.bin")) == []
+    assert list(tmp_path.glob("*_tables.json")) == []
 
 
 def test_corrupt_database_fails_closed_and_preserves_files(
