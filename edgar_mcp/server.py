@@ -17,9 +17,11 @@ sys.stdout = sys.stderr
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import threading
 import time
@@ -32,8 +34,9 @@ from typing import Annotated, Any, Literal
 
 import requests
 from fastmcp import FastMCP
-from fastmcp.server.context import Context
 from pydantic import Field
+
+from _edgar_flat_file_io import atomic_write_flat_file, read_flat_file
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
@@ -252,17 +255,17 @@ _ARTIFACT_HANDLE_TTL_SECONDS = 15 * 60
 _MAX_FILING_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_ARTIFACT_RECORDS = 64
 _MAX_ARTIFACT_REGISTRY_BYTES = 64 * 1024 * 1024
-_PROCESS_ARTIFACT_SESSION_ID = f"process:{secrets.token_urlsafe(18)}"
+_MANAGED_ARTIFACT_DIRNAME = ".edgar_artifacts"
+_ARTIFACT_DATABASE_FILENAME = "capabilities.sqlite3"
+_MANAGED_BACKING_PREFIX = ".artifact-"
+_MANAGED_BACKING_SUFFIX = ".bin"
+_MANAGED_TEMP_PREFIX = ".artifact-tmp-"
+_MANAGED_TEMP_SUFFIX = ".tmp"
 
 
 @dataclass(frozen=True, slots=True)
 class _TrustedArtifactWriteReceipt:
-    root_path: str
-    root_device: int
-    root_inode: int
-    filename: str
-    file_device: int
-    file_inode: int
+    source_name: str
     trusted_content: bytes
     sha256: str
 
@@ -273,46 +276,131 @@ class _ArtifactRecord:
     producer: str
     kind: str
     media_type: str
-    owner_id: str
-    session_id: str
+    source_name: str
     root_path: str
     root_device: int
     root_inode: int
-    filename: str
+    backing_filename: str
     file_device: int
     file_inode: int
     size: int
     sha256: str
-    trusted_content: bytes
     created_at: float
     expires_at: float
 
 
-_ARTIFACT_RECORDS: dict[str, _ArtifactRecord] = {}
-_ARTIFACT_RECORDS_LOCK = threading.Lock()
+@dataclass(frozen=True, slots=True)
+class _ManagedFileIdentity:
+    filename: str
+    device: int
+    inode: int
 
 
-def _artifact_binding(args: dict[str, Any]) -> tuple[str, str]:
-    """Return trusted owner/session values hidden from the public tool schema."""
-    owner_id = str(
-        args.get("__artifact_owner_id")
-        or os.getenv("EDGAR_MCP_ARTIFACT_OWNER_ID", "")
-    ).strip()
-    session_id = str(
-        args.get("__artifact_session_id")
-        or os.getenv("EDGAR_MCP_ARTIFACT_SESSION_ID", "")
-        or _PROCESS_ARTIFACT_SESSION_ID
-    ).strip()
-    return owner_id, session_id
+@dataclass(frozen=True, slots=True)
+class _ArtifactCleanup:
+    expired: tuple[_ManagedFileIdentity, ...]
+    orphaned: tuple[_ManagedFileIdentity, ...]
+    stale_temporaries: tuple[_ManagedFileIdentity, ...]
 
 
-def _context_session_id(ctx: Context) -> str:
+class _ArtifactCapacityError(ValueError):
+    pass
+
+
+def _artifact_handle_digest(handle: str) -> str:
+    return hashlib.sha256(handle.encode("utf-8")).hexdigest()
+
+
+def _artifact_is_expired(expires_at: float, now: float) -> bool:
+    return expires_at <= now
+
+
+def _artifact_capacity_allows(
+    live_count: int,
+    live_bytes: int,
+    newcomer_bytes: int,
+) -> bool:
+    return (
+        live_count < _MAX_ARTIFACT_RECORDS
+        and live_bytes + newcomer_bytes <= _MAX_ARTIFACT_REGISTRY_BYTES
+    )
+
+
+def _sanitize_artifact_source_name(value: str) -> str:
+    basename = Path(str(value or "")).name
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("._")
+    return (sanitized or "filing.md")[:180]
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _has_hex_token(value: str, prefix: str, suffix: str) -> bool:
+    token = value[len(prefix) : -len(suffix)]
+    return len(token) == 48 and all(
+        character in "0123456789abcdef" for character in token
+    )
+
+
+def _is_managed_backing_name(value: str) -> bool:
+    return (
+        Path(value).name == value
+        and value.startswith(_MANAGED_BACKING_PREFIX)
+        and value.endswith(_MANAGED_BACKING_SUFFIX)
+        and _has_hex_token(value, _MANAGED_BACKING_PREFIX, _MANAGED_BACKING_SUFFIX)
+    )
+
+
+def _is_managed_temp_name(value: str) -> bool:
+    return (
+        Path(value).name == value
+        and value.startswith(_MANAGED_TEMP_PREFIX)
+        and value.endswith(_MANAGED_TEMP_SUFFIX)
+        and _has_hex_token(value, _MANAGED_TEMP_PREFIX, _MANAGED_TEMP_SUFFIX)
+    )
+
+
+def _validate_artifact_row(row: sqlite3.Row, root_stat: os.stat_result) -> None:
     try:
-        value = str(ctx.session_id or "").strip()
-    except Exception:
-        value = ""
-    return value or _PROCESS_ARTIFACT_SESSION_ID
+        handle_digest = str(row["handle_sha256"])
+        producer = str(row["producer"])
+        kind = str(row["kind"])
+        media_type = str(row["media_type"])
+        source_name = str(row["source_name"])
+        backing_filename = str(row["backing_filename"])
+        root_device = int(row["root_device"])
+        root_inode = int(row["root_inode"])
+        file_device = int(row["file_device"])
+        file_inode = int(row["file_inode"])
+        size = int(row["size"])
+        content_digest = str(row["content_sha256"])
+        created_at = float(row["created_at"])
+        expires_at = float(row["expires_at"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Artifact capability row is invalid") from exc
 
+    if (
+        not _is_sha256(handle_digest)
+        or not producer
+        or not kind
+        or not media_type
+        or source_name != _sanitize_artifact_source_name(source_name)
+        or not _is_managed_backing_name(backing_filename)
+        or (root_device, root_inode) != (root_stat.st_dev, root_stat.st_ino)
+        or file_device < 0
+        or file_inode <= 0
+        or size < 0
+        or size > _MAX_FILING_ARTIFACT_BYTES
+        or not _is_sha256(content_digest)
+        or not math.isfinite(created_at)
+        or not math.isfinite(expires_at)
+        or expires_at <= created_at
+        or expires_at - created_at > _ARTIFACT_HANDLE_TTL_SECONDS + 1e-6
+    ):
+        raise ValueError("Artifact capability row is invalid")
 
 def _open_artifact_root(root_path: Path) -> int:
     flags = os.O_RDONLY
@@ -322,45 +410,268 @@ def _open_artifact_root(root_path: Path) -> int:
     return os.open(str(root_path), flags)
 
 
-def _read_artifact_file(
-    root_path: Path,
-    filename: str,
-) -> tuple[bytes, os.stat_result, os.stat_result]:
-    if not filename or Path(filename).name != filename:
-        raise ValueError("Artifact record contains an invalid filename")
-
-    root_fd = _open_artifact_root(root_path)
-    file_fd = -1
+def _open_managed_artifact_root(*, create: bool) -> tuple[Path, int, os.stat_result]:
     try:
-        root_stat = os.fstat(root_fd)
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        file_fd = os.open(filename, flags, dir_fd=root_fd)
-        file_stat = os.fstat(file_fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError("Artifact is not a regular file")
-        if file_stat.st_size > _MAX_FILING_ARTIFACT_BYTES:
-            raise ValueError("Artifact exceeds the maximum supported size")
-
-        chunks: list[bytes] = []
-        remaining = _MAX_FILING_ARTIFACT_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(file_fd, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
-        if len(content) > _MAX_FILING_ARTIFACT_BYTES:
-            raise ValueError("Artifact exceeds the maximum supported size")
-        return content, root_stat, file_stat
+        output_root = FILE_OUTPUT_DIR.resolve(strict=True)
+        output_fd = _open_artifact_root(output_root)
+    except OSError as exc:
+        raise ValueError("Artifact output directory is unavailable") from exc
+    try:
+        if create:
+            try:
+                os.mkdir(_MANAGED_ARTIFACT_DIRNAME, 0o700, dir_fd=output_fd)
+            except FileExistsError:
+                pass
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        managed_fd = os.open(_MANAGED_ARTIFACT_DIRNAME, flags, dir_fd=output_fd)
+    except OSError as exc:
+        raise ValueError("Artifact capability store is unavailable") from exc
     finally:
-        if file_fd >= 0:
-            os.close(file_fd)
+        os.close(output_fd)
+
+    managed_stat = os.fstat(managed_fd)
+    if not stat.S_ISDIR(managed_stat.st_mode):
+        os.close(managed_fd)
+        raise ValueError("Artifact capability store is not a directory")
+    if managed_stat.st_uid != os.geteuid():
+        os.close(managed_fd)
+        raise ValueError("Artifact capability store has an unexpected owner")
+    os.fchmod(managed_fd, 0o700)
+    return output_root / _MANAGED_ARTIFACT_DIRNAME, managed_fd, managed_stat
+
+
+def _connect_artifact_store(
+    root_path: Path,
+    root_fd: int,
+    *,
+    create: bool,
+) -> sqlite3.Connection:
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        database_fd = os.open(
+            _ARTIFACT_DATABASE_FILENAME,
+            flags,
+            0o600,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise ValueError("Artifact capability database is unavailable") from exc
+    try:
+        database_stat = os.fstat(database_fd)
+        if not stat.S_ISREG(database_stat.st_mode):
+            raise ValueError("Artifact capability database is not a regular file")
+        if database_stat.st_uid != os.geteuid():
+            raise ValueError("Artifact capability database has an unexpected owner")
+        os.fchmod(database_fd, 0o600)
+    finally:
+        os.close(database_fd)
+
+    try:
+        connection = sqlite3.connect(
+            root_path / _ARTIFACT_DATABASE_FILENAME,
+            timeout=5.0,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA synchronous = FULL")
+        observed_root = os.stat(root_path, follow_symlinks=False)
+        observed_database = os.stat(
+            _ARTIFACT_DATABASE_FILENAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        expected_root = os.fstat(root_fd)
+        if (observed_root.st_dev, observed_root.st_ino) != (
+            expected_root.st_dev,
+            expected_root.st_ino,
+        ) or (observed_database.st_dev, observed_database.st_ino) != (
+            database_stat.st_dev,
+            database_stat.st_ino,
+        ):
+            raise ValueError("Artifact capability store identity changed while opening")
+        if create:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS artifact_capabilities (
+                    handle_sha256 TEXT PRIMARY KEY,
+                    producer TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    backing_filename TEXT NOT NULL UNIQUE,
+                    root_device INTEGER NOT NULL,
+                    root_inode INTEGER NOT NULL,
+                    file_device INTEGER NOT NULL,
+                    file_inode INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+                """
+            )
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(artifact_capabilities)")
+        }
+        expected_columns = {
+            "handle_sha256",
+            "producer",
+            "kind",
+            "media_type",
+            "source_name",
+            "backing_filename",
+            "root_device",
+            "root_inode",
+            "file_device",
+            "file_inode",
+            "size",
+            "content_sha256",
+            "created_at",
+            "expires_at",
+        }
+        if columns != expected_columns:
+            raise ValueError("Artifact capability database has an unexpected schema")
+        integrity = connection.execute("PRAGMA quick_check(1)").fetchone()
+        if integrity is None or str(integrity[0]) != "ok":
+            raise ValueError("Artifact capability database failed its integrity check")
+        return connection
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        if "connection" in locals():
+            connection.close()
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError("Artifact capability database is unavailable") from exc
+
+
+def _managed_identity(root_fd: int, filename: str) -> _ManagedFileIdentity | None:
+    try:
+        observed = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return _ManagedFileIdentity(
+        filename=filename,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+    )
+
+
+def _derive_artifact_cleanup(
+    connection: sqlite3.Connection,
+    root_fd: int,
+    now: float,
+) -> _ArtifactCleanup:
+    root_stat = os.fstat(root_fd)
+    rows = tuple(connection.execute("SELECT * FROM artifact_capabilities"))
+    for row in rows:
+        _validate_artifact_row(row, root_stat)
+    if (
+        len(rows) > _MAX_ARTIFACT_RECORDS
+        or sum(int(row["size"]) for row in rows) > _MAX_ARTIFACT_REGISTRY_BYTES
+    ):
+        raise ValueError("Artifact capability store exceeds its bounded capacity")
+
+    expired_rows = tuple(row for row in rows if float(row["expires_at"]) <= now)
+    connection.execute(
+        "DELETE FROM artifact_capabilities WHERE expires_at <= ?",
+        (now,),
+    )
+    registered = {
+        str(row["backing_filename"])
+        for row in connection.execute(
+            "SELECT backing_filename FROM artifact_capabilities"
+        )
+    }
+    expired = tuple(
+        _ManagedFileIdentity(
+            filename=str(row["backing_filename"]),
+            device=int(row["file_device"]),
+            inode=int(row["file_inode"]),
+        )
+        for row in expired_rows
+    )
+    orphaned: list[_ManagedFileIdentity] = []
+    stale_temporaries: list[_ManagedFileIdentity] = []
+    stale_before = now - _ARTIFACT_HANDLE_TTL_SECONDS
+    for filename in os.listdir(root_fd):
+        if (
+            _is_managed_backing_name(filename)
+            and filename not in registered
+            and all(item.filename != filename for item in expired)
+        ):
+            identity = _managed_identity(root_fd, filename)
+            if identity is not None:
+                orphaned.append(identity)
+        elif _is_managed_temp_name(filename):
+            try:
+                observed = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if observed.st_mtime <= stale_before:
+                stale_temporaries.append(
+                    _ManagedFileIdentity(
+                        filename=filename,
+                        device=observed.st_dev,
+                        inode=observed.st_ino,
+                    )
+                )
+    return _ArtifactCleanup(
+        expired=expired,
+        orphaned=tuple(orphaned),
+        stale_temporaries=tuple(stale_temporaries),
+    )
+
+
+def _unlink_managed_identity(root_fd: int, identity: _ManagedFileIdentity) -> None:
+    if not (
+        _is_managed_backing_name(identity.filename)
+        or _is_managed_temp_name(identity.filename)
+    ):
+        return
+    observed = _managed_identity(root_fd, identity.filename)
+    if observed != identity:
+        return
+    try:
+        os.unlink(identity.filename, dir_fd=root_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _apply_artifact_cleanup(
+    root_path: Path,
+    root_device: int,
+    root_inode: int,
+    cleanup: _ArtifactCleanup,
+) -> None:
+    try:
+        root_fd = _open_artifact_root(root_path)
+    except OSError:
+        return
+    try:
+        observed_root = os.fstat(root_fd)
+        if (observed_root.st_dev, observed_root.st_ino) != (root_device, root_inode):
+            return
+        for identity in (
+            *cleanup.expired,
+            *cleanup.orphaned,
+            *cleanup.stale_temporaries,
+        ):
+            try:
+                _unlink_managed_identity(root_fd, identity)
+            except OSError:
+                continue
+        try:
+            os.fsync(root_fd)
+        except OSError:
+            pass
+    finally:
         os.close(root_fd)
 
 
@@ -372,54 +683,15 @@ def _write_trusted_artifact(path: Path, content: str) -> _TrustedArtifactWriteRe
             "Trusted artifact output must be a flat file in the EDGAR output directory"
         )
 
-    root_fd = _open_artifact_root(root_path)
-    root_stat = os.fstat(root_fd)
-    temp_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
-    temp_created = False
     trusted_content = content.encode("utf-8")
     if len(trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
-        os.close(root_fd)
         raise ValueError("Artifact exceeds the maximum supported size")
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        file_fd = os.open(temp_name, flags, 0o600, dir_fd=root_fd)
-        temp_created = True
-        try:
-            remaining = memoryview(trusted_content)
-            while remaining:
-                written = os.write(file_fd, remaining)
-                if written <= 0:
-                    raise OSError("Failed to write trusted artifact")
-                remaining = remaining[written:]
-            os.fsync(file_fd)
-            file_stat = os.fstat(file_fd)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ValueError("Trusted artifact output is not a regular file")
-            if file_stat.st_size != len(trusted_content):
-                raise ValueError("Trusted artifact write size did not match producer bytes")
-            receipt = _TrustedArtifactWriteReceipt(
-                root_path=str(root_path),
-                root_device=root_stat.st_dev,
-                root_inode=root_stat.st_ino,
-                filename=path.name,
-                file_device=file_stat.st_dev,
-                file_inode=file_stat.st_ino,
-                trusted_content=trusted_content,
-                sha256=hashlib.sha256(trusted_content).hexdigest(),
-            )
-        finally:
-            os.close(file_fd)
-        os.replace(temp_name, path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-        temp_created = False
-        return receipt
-    finally:
-        if temp_created:
-            try:
-                os.unlink(temp_name, dir_fd=root_fd)
-            except FileNotFoundError:
-                pass
-        os.close(root_fd)
+    write = atomic_write_flat_file(root_path, path.name, trusted_content)
+    return _TrustedArtifactWriteReceipt(
+        source_name=_sanitize_artifact_source_name(write.filename),
+        trusted_content=trusted_content,
+        sha256=hashlib.sha256(trusted_content).hexdigest(),
+    )
 
 
 def _issue_artifact_handle(
@@ -428,51 +700,200 @@ def _issue_artifact_handle(
     producer: str,
     kind: str,
     media_type: str,
-    owner_id: str,
-    session_id: str,
     ttl_seconds: int = _ARTIFACT_HANDLE_TTL_SECONDS,
 ) -> _ArtifactRecord:
     if len(receipt.trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
         raise ValueError("Artifact exceeds the maximum supported size")
     if len(receipt.trusted_content) > _MAX_ARTIFACT_REGISTRY_BYTES:
-        raise ValueError("Artifact exceeds the in-memory registry capacity")
+        raise _ArtifactCapacityError("Artifact exceeds the capability store capacity")
+    observed_digest = hashlib.sha256(receipt.trusted_content).hexdigest()
+    if receipt.sha256 != observed_digest:
+        raise ValueError("Artifact receipt digest does not match its producer bytes")
+    source_name = _sanitize_artifact_source_name(receipt.source_name)
     now = time.time()
+    ttl = min(_ARTIFACT_HANDLE_TTL_SECONDS, max(1, int(ttl_seconds)))
     handle = f"edgar_artifact_{secrets.token_urlsafe(32)}"
+    handle_digest = _artifact_handle_digest(handle)
+    backing_filename = (
+        f"{_MANAGED_BACKING_PREFIX}{secrets.token_hex(24)}"
+        f"{_MANAGED_BACKING_SUFFIX}"
+    )
+    temp_filename = (
+        f"{_MANAGED_TEMP_PREFIX}{secrets.token_hex(24)}{_MANAGED_TEMP_SUFFIX}"
+    )
+    root_path, root_fd, root_stat = _open_managed_artifact_root(create=True)
+    connection: sqlite3.Connection | None = None
+    temp_identity: _ManagedFileIdentity | None = None
+    final_identity: _ManagedFileIdentity | None = None
+    cleanup = _ArtifactCleanup((), (), ())
+    committed = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(temp_filename, flags, 0o600, dir_fd=root_fd)
+        try:
+            remaining = memoryview(receipt.trusted_content)
+            while remaining:
+                written = os.write(file_fd, remaining)
+                if written <= 0:
+                    raise OSError("Failed to write managed artifact backing")
+                remaining = remaining[written:]
+            os.fsync(file_fd)
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("Managed artifact backing is not a regular file")
+            if file_stat.st_size != len(receipt.trusted_content):
+                raise ValueError("Managed artifact backing size did not match producer bytes")
+            os.fchmod(file_fd, 0o600)
+            temp_identity = _ManagedFileIdentity(
+                filename=temp_filename,
+                device=file_stat.st_dev,
+                inode=file_stat.st_ino,
+            )
+        finally:
+            os.close(file_fd)
+
+        connection = _connect_artifact_store(root_path, root_fd, create=True)
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup = _derive_artifact_cleanup(connection, root_fd, now)
+        capacity = connection.execute(
+            """
+            SELECT COUNT(*) AS live_count, COALESCE(SUM(size), 0) AS live_bytes
+            FROM artifact_capabilities
+            """
+        ).fetchone()
+        if capacity is None or not _artifact_capacity_allows(
+            int(capacity["live_count"]),
+            int(capacity["live_bytes"]),
+            len(receipt.trusted_content),
+        ):
+            connection.commit()
+            committed = True
+            raise _ArtifactCapacityError(
+                "Artifact capability capacity is full; retry after an existing handle expires"
+            )
+
+        os.link(
+            temp_filename,
+            backing_filename,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        final_identity = _ManagedFileIdentity(
+            filename=backing_filename,
+            device=temp_identity.device,
+            inode=temp_identity.inode,
+        )
+        os.unlink(temp_filename, dir_fd=root_fd)
+        temp_identity = None
+        if _managed_identity(root_fd, backing_filename) != final_identity:
+            raise OSError("Managed artifact backing publication failed")
+        os.fsync(root_fd)
+        expires_at = now + ttl
+        connection.execute(
+            """
+            INSERT INTO artifact_capabilities (
+                handle_sha256, producer, kind, media_type, source_name,
+                backing_filename, root_device, root_inode, file_device,
+                file_inode, size, content_sha256, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                handle_digest,
+                producer,
+                kind,
+                media_type,
+                source_name,
+                backing_filename,
+                root_stat.st_dev,
+                root_stat.st_ino,
+                final_identity.device,
+                final_identity.inode,
+                len(receipt.trusted_content),
+                receipt.sha256,
+                now,
+                expires_at,
+            ),
+        )
+        connection.commit()
+        committed = True
+        record = _ArtifactRecord(
+            handle=handle,
+            producer=producer,
+            kind=kind,
+            media_type=media_type,
+            source_name=source_name,
+            root_path=str(root_path),
+            root_device=root_stat.st_dev,
+            root_inode=root_stat.st_ino,
+            backing_filename=backing_filename,
+            file_device=final_identity.device,
+            file_inode=final_identity.inode,
+            size=len(receipt.trusted_content),
+            sha256=receipt.sha256,
+            created_at=now,
+            expires_at=expires_at,
+        )
+    except Exception:
+        if connection is not None and not committed:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        if temp_identity is not None:
+            try:
+                _unlink_managed_identity(root_fd, temp_identity)
+            except OSError:
+                pass
+        if final_identity is not None and not committed:
+            try:
+                _unlink_managed_identity(root_fd, final_identity)
+            except OSError:
+                pass
+        if committed:
+            if connection is not None:
+                connection.close()
+                connection = None
+            _apply_artifact_cleanup(
+                root_path,
+                root_stat.st_dev,
+                root_stat.st_ino,
+                cleanup,
+            )
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(root_fd)
+
+    _apply_artifact_cleanup(
+        root_path,
+        root_stat.st_dev,
+        root_stat.st_ino,
+        cleanup,
+    )
+    return record
+
+
+def _artifact_record_from_row(handle: str, root_path: Path, row: sqlite3.Row) -> _ArtifactRecord:
     record = _ArtifactRecord(
         handle=handle,
-        producer=producer,
-        kind=kind,
-        media_type=media_type,
-        owner_id=owner_id,
-        session_id=session_id,
-        root_path=receipt.root_path,
-        root_device=receipt.root_device,
-        root_inode=receipt.root_inode,
-        filename=receipt.filename,
-        file_device=receipt.file_device,
-        file_inode=receipt.file_inode,
-        size=len(receipt.trusted_content),
-        sha256=receipt.sha256,
-        trusted_content=receipt.trusted_content,
-        created_at=now,
-        expires_at=now + max(1, int(ttl_seconds)),
+        producer=str(row["producer"]),
+        kind=str(row["kind"]),
+        media_type=str(row["media_type"]),
+        source_name=str(row["source_name"]),
+        root_path=str(root_path),
+        root_device=int(row["root_device"]),
+        root_inode=int(row["root_inode"]),
+        backing_filename=str(row["backing_filename"]),
+        file_device=int(row["file_device"]),
+        file_inode=int(row["file_inode"]),
+        size=int(row["size"]),
+        sha256=str(row["content_sha256"]),
+        created_at=float(row["created_at"]),
+        expires_at=float(row["expires_at"]),
     )
-    with _ARTIFACT_RECORDS_LOCK:
-        expired = [key for key, value in _ARTIFACT_RECORDS.items() if value.expires_at <= now]
-        for key in expired:
-            _ARTIFACT_RECORDS.pop(key, None)
-        registry_bytes = sum(value.size for value in _ARTIFACT_RECORDS.values())
-        while _ARTIFACT_RECORDS and (
-            len(_ARTIFACT_RECORDS) >= _MAX_ARTIFACT_RECORDS
-            or registry_bytes + record.size > _MAX_ARTIFACT_REGISTRY_BYTES
-        ):
-            oldest_handle, oldest_record = min(
-                _ARTIFACT_RECORDS.items(),
-                key=lambda item: item[1].created_at,
-            )
-            _ARTIFACT_RECORDS.pop(oldest_handle, None)
-            registry_bytes -= oldest_record.size
-        _ARTIFACT_RECORDS[handle] = record
     return record
 
 
@@ -482,49 +903,79 @@ def _resolve_artifact_handle(
     expected_producer: str,
     expected_kind: str,
     expected_media_type: str,
-    owner_id: str,
-    session_id: str,
 ) -> tuple[_ArtifactRecord, bytes]:
     normalized = str(handle or "").strip()
     if not normalized:
         raise ValueError("artifact_handle is required; local file paths are not accepted")
     now = time.time()
-    with _ARTIFACT_RECORDS_LOCK:
-        record = _ARTIFACT_RECORDS.get(normalized)
-        if record is None:
-            raise ValueError("Artifact handle is unknown or was not issued by this Edgar producer")
-        if record.expires_at <= now:
-            _ARTIFACT_RECORDS.pop(normalized, None)
-            raise ValueError("Artifact handle has expired")
+    handle_digest = _artifact_handle_digest(normalized)
+    root_path, root_fd, root_stat = _open_managed_artifact_root(create=False)
+    connection: sqlite3.Connection | None = None
+    cleanup = _ArtifactCleanup((), (), ())
+    try:
+        connection = _connect_artifact_store(root_path, root_fd, create=False)
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM artifact_capabilities WHERE handle_sha256 = ?",
+            (handle_digest,),
+        ).fetchone()
+        cleanup = _derive_artifact_cleanup(connection, root_fd, now)
+        connection.commit()
+    except Exception:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(root_fd)
 
-    if record.owner_id != owner_id or record.session_id != session_id:
-        raise ValueError("Artifact handle is not valid for this owner/session")
+    _apply_artifact_cleanup(
+        root_path,
+        root_stat.st_dev,
+        root_stat.st_ino,
+        cleanup,
+    )
+    if row is None:
+        raise ValueError("Artifact handle is unknown or was not issued by this Edgar producer")
+    record = _artifact_record_from_row(normalized, root_path, row)
+    if _artifact_is_expired(record.expires_at, now):
+        raise ValueError("Artifact handle has expired")
     if record.producer != expected_producer:
         raise ValueError("Artifact handle was issued by the wrong producer")
     if record.kind != expected_kind or record.media_type != expected_media_type:
         raise ValueError("Artifact handle has the wrong kind or media type")
 
     try:
-        observed_content, root_stat, file_stat = _read_artifact_file(
+        snapshot = read_flat_file(
             Path(record.root_path),
-            record.filename,
+            record.backing_filename,
+            max_bytes=_MAX_FILING_ARTIFACT_BYTES,
         )
     except OSError as exc:
         raise ValueError("Artifact could not be opened without following links") from exc
-    if (root_stat.st_dev, root_stat.st_ino) != (record.root_device, record.root_inode):
+    except ValueError as exc:
+        if str(exc) == "file must be a regular single-link file":
+            raise ValueError("Artifact is not a regular file") from exc
+        if str(exc) == "file exceeds the maximum supported size":
+            raise ValueError("Artifact exceeds the maximum supported size") from exc
+        raise ValueError("Artifact could not be read as a stable regular file") from exc
+    identity = snapshot.identity
+    if (identity.root_device, identity.root_inode) != (record.root_device, record.root_inode):
         raise ValueError("Artifact output directory identity changed after issuance")
-    if (file_stat.st_dev, file_stat.st_ino) != (record.file_device, record.file_inode):
+    if (identity.file_device, identity.file_inode) != (record.file_device, record.file_inode):
         raise ValueError("Artifact file identity changed after issuance")
     if (
-        len(observed_content) != record.size
-        or hashlib.sha256(observed_content).hexdigest() != record.sha256
+        len(snapshot.content) != record.size
+        or hashlib.sha256(snapshot.content).hexdigest() != record.sha256
     ):
         raise ValueError("Artifact content changed after issuance")
-    if time.time() >= record.expires_at:
-        with _ARTIFACT_RECORDS_LOCK:
-            _ARTIFACT_RECORDS.pop(normalized, None)
+    if _artifact_is_expired(record.expires_at, time.time()):
         raise ValueError("Artifact handle has expired")
-    return record, record.trusted_content
+    return record, snapshot.content
 
 ExtractionPeriod = Annotated[
     str,
@@ -3641,15 +4092,6 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         file_path,
         "\n".join(lines).strip() + "\n",
     )
-    owner_id, session_id = _artifact_binding(args)
-    artifact_record = _issue_artifact_handle(
-        write_receipt,
-        producer="get_filing_sections",
-        kind=_FILING_ARTIFACT_KIND,
-        media_type=_FILING_ARTIFACT_MEDIA_TYPE,
-        owner_id=owner_id,
-        session_id=session_id,
-    )
 
     tables_file_path: Path | None = None
     if include_tables:
@@ -3664,6 +4106,20 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         if _deadline_expired(args):
             return {"status": "error", "message": "Request timed out before structured tables could be written"}
         tables_file_path.write_text(json.dumps(tables_structured, indent=2), encoding="utf-8")
+
+    try:
+        artifact_record = _issue_artifact_handle(
+            write_receipt,
+            producer="get_filing_sections",
+            kind=_FILING_ARTIFACT_KIND,
+            media_type=_FILING_ARTIFACT_MEDIA_TYPE,
+        )
+    except _ArtifactCapacityError as exc:
+        return {
+            "status": "error",
+            "error_type": "artifact_capacity_exceeded",
+            "message": str(exc),
+        }
 
     # Return summary (no full text inline) + file_path
     summary_sections = {
@@ -4012,15 +4468,12 @@ def _proxy_get_filing_evidence(args: dict) -> dict:
 
 
 def _proxy_extract_filing_file(args: dict) -> dict:
-    owner_id, session_id = _artifact_binding(args)
     try:
         record, original_bytes = _resolve_artifact_handle(
             str(args.get("artifact_handle") or ""),
             expected_producer="get_filing_sections",
             expected_kind=_FILING_ARTIFACT_KIND,
             expected_media_type=_FILING_ARTIFACT_MEDIA_TYPE,
-            owner_id=owner_id,
-            session_id=session_id,
         )
     except Exception as exc:
         return {
@@ -4082,7 +4535,7 @@ def _proxy_extract_filing_file(args: dict) -> dict:
             "/api/documents/scratch-extract",
             {
                 "content": original_text,
-                "source_name": record.filename,
+                "source_name": record.source_name,
                 "section": section_name,
                 "schemas": [schema_name],
             },
@@ -4949,8 +5402,6 @@ async def get_filing_sections(
     tables_only: bool = False,
     fallback: bool = False,
     output: Literal["inline", "file"] = "file",
-    *,
-    ctx: Context,
 ) -> dict:
     """
     Parse qualitative sections from one filing resolved by ticker/year/quarter.
@@ -4989,7 +5440,6 @@ async def get_filing_sections(
         args["sections"] = sections
     if source is not None:
         args["source"] = source
-    args["__artifact_session_id"] = _context_session_id(ctx)
     return await _run_tool_guarded("get_filing_sections", args)
 
 
@@ -5489,8 +5939,6 @@ async def extract_filing_file(
     artifact_handle: str,
     schema_name: str,
     sections_filter: list[str] | None = None,
-    *,
-    ctx: Context,
 ) -> dict:
     """
     Resolve a short-lived artifact handle issued by get_filing_sections and run
@@ -5505,7 +5953,6 @@ async def extract_filing_file(
     args = {
         "artifact_handle": artifact_handle,
         "schema_name": schema_name,
-        "__artifact_session_id": _context_session_id(ctx),
     }
     if sections_filter:
         args["sections_filter"] = sections_filter

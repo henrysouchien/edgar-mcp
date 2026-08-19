@@ -33,5 +33,11 @@ exclude = ["/edgar_mcp/.edgar_mcp_server_*.pid"]
 [tool.hatch.build.targets.wheel]
 packages = ["edgar_mcp"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"_edgar_flat_file_io.py" = "_edgar_flat_file_io.py"
+
 [tool.hatch.build.targets.sdist]
 include = ["edgar_mcp/", "pyproject.toml", "README.md", "LICENSE", "server.json"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"_edgar_flat_file_io.py" = "_edgar_flat_file_io.py"
