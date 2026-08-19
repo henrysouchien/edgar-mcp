@@ -3146,6 +3146,9 @@ def _proxy_get_financials(args: dict) -> dict:
             "source": source_info,
         },
     }
+    for envelope_key in ("semantic_status", "coverage_status", "coverage_warning"):
+        if envelope_key in result:
+            response[envelope_key] = result[envelope_key]
     if result.get("scope_warnings"):
         response["scope_warnings"] = result.get("scope_warnings")
     if result.get("scope_bridges"):
@@ -3705,6 +3708,9 @@ def _proxy_get_filing_sections(args: dict) -> dict:
             "section_count": len(sections_data),
         },
     }
+    for envelope_key in ("semantic_status", "coverage_status", "coverage_warning"):
+        if envelope_key in result:
+            response[envelope_key] = result[envelope_key]
     filing_identity = result.get("filing")
     if isinstance(filing_identity, dict):
         response["filing"] = dict(filing_identity)
