@@ -116,6 +116,85 @@ def test_product_file_routes_use_shared_atomic_writer() -> None:
         assert "atomic_write_flat_file(" in source
 
 
+def test_financials_output_replaces_symlink_without_clobbering_victim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _module(monkeypatch, tmp_path)
+    victim = tmp_path.parent / f"{tmp_path.name}-financials-victim.json"
+    victim.write_text('{"preserve": true}', encoding="utf-8")
+    output = tmp_path / "AAPL_4Q25_financials.json"
+    output.symlink_to(victim)
+    monkeypatch.setattr(
+        module,
+        "_call_api",
+        lambda *args, **kwargs: {
+            "status": "success",
+            "facts": [{"tag": "Revenue", "current_value": 100}],
+            "metadata": {"source": {"filing_type": "10-K"}},
+        },
+    )
+
+    result = module._proxy_get_financials(
+        {"ticker": "AAPL", "year": 2025, "quarter": 4, "output": "file"}
+    )
+
+    assert result["status"] == "success"
+    assert Path(result["file_path"]) == output
+    assert not output.is_symlink()
+    assert json.loads(output.read_text(encoding="utf-8"))["facts"][0]["tag"] == "Revenue"
+    assert victim.read_text(encoding="utf-8") == '{"preserve": true}'
+
+
+def test_sections_tables_output_replaces_symlink_and_still_returns_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _module(monkeypatch, tmp_path)
+    victim = tmp_path.parent / f"{tmp_path.name}-tables-victim.json"
+    victim.write_text('{"preserve": true}', encoding="utf-8")
+    tables_output = tmp_path / "AAPL_4Q25_item_1_tables.json"
+    tables_output.symlink_to(victim)
+    monkeypatch.setattr(
+        module,
+        "_call_api",
+        lambda *args, **kwargs: {
+            "status": "success",
+            "filing_type": "10-K",
+            "sections": {
+                "item_1": {
+                    "header": "Item 1. Business",
+                    "word_count": 2,
+                    "text": "Trusted disclosure.",
+                    "tables": ["| A | B |"],
+                }
+            },
+            "tables_structured": {"item_1": [{"label": "Revenue"}]},
+        },
+    )
+
+    result = module._proxy_get_filing_sections(
+        {
+            "ticker": "AAPL",
+            "year": 2025,
+            "quarter": 4,
+            "sections": ["item_1"],
+            "include_tables": True,
+            "output": "file",
+        }
+    )
+
+    assert result["status"] == "success"
+    assert result["artifact_handle"].startswith("edgar_artifact_")
+    assert Path(result["tables_file_path"]) == tables_output
+    assert not tables_output.is_symlink()
+    assert json.loads(tables_output.read_text(encoding="utf-8")) == {
+        "item_1": [{"label": "Revenue"}]
+    }
+    assert victim.read_text(encoding="utf-8") == '{"preserve": true}'
+    assert b"Trusted disclosure." in _resolve(module, result["artifact_handle"])[1]
+
+
 def test_store_persists_only_bearer_digest_and_private_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
