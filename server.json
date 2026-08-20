@@ -3,7 +3,7 @@
   "name": "io.github.henrysouchien/edgar-mcp",
   "title": "EdgarParser MCP",
   "description": "MCP stdio server for source-backed SEC EDGAR financial data from the hosted EdgarParser API.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "repository": {
     "url": "https://github.com/henrysouchien/edgar-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "edgar-mcp",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "transport": {
         "type": "stdio"
       },
