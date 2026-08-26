@@ -23,20 +23,27 @@ import re
 import secrets
 import sqlite3
 import stat
-import threading
 import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import requests
 from fastmcp import FastMCP
-from pydantic import Field
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from _edgar_flat_file_io import atomic_write_flat_file, read_flat_file
+from _edgar_sec_transport import sec_get
 
 # Restore stdout for MCP transport.
 sys.stdout = _real_stdout
@@ -49,40 +56,6 @@ ROW_CLASS_SEGMENT_MEMBER = "segment_member"
 _ROW_CLASS_SUBTOTAL = "subtotal_or_total"
 _ROW_CLASS_UNKNOWN = "unknown"
 
-_ROLE_DISCLOSURE_REJECT = (
-    "details",
-    "detail",
-    "additional",
-    "schedule",
-    "computation",
-    "narrative",
-    "supplemental",
-    "disclosure",
-)
-_ROLE_BS_RE = re.compile(
-    r"(balancesheets?)"
-    r"|(statements?of.*(balance|financialposition|financialcondition|condition|capitalization))"
-    r"|(financialposition|financialcondition)"
-)
-_ROLE_IS_RE = re.compile(
-    r"(incomestatements?)"
-    r"|((?!.*comprehensive)statements?of.*(income|earnings|operations))"
-)
-_ROLE_CI_RE = re.compile(r"(statements?of.*comprehensive)|(comprehensive(income|loss))")
-_ROLE_EQ_RE = re.compile(
-    r"((stockholders|shareholders|shareowners|partners|member)(equity|deficit|investment|capital))"
-    r"|(statements?of.*(equity|capital|investment|deficit))"
-    r"|(changesin.*(equity|capital|investment))"
-)
-_ROLE_CF_RE = re.compile(r"(cashflow(s)?statement(s)?)|(statements?of.*cashflow)|(cashflow)")
-_ROLE_BUCKETS = (
-    ("BS", _ROLE_BS_RE),
-    ("IS", _ROLE_IS_RE),
-    ("CI", _ROLE_CI_RE),
-    ("EQ", _ROLE_EQ_RE),
-    ("CF", _ROLE_CF_RE),
-    ("DISC", None),
-)
 _FRIENDLY_ROLE_NAMES = (
     "balance_sheet",
     "income_statement",
@@ -91,14 +64,6 @@ _FRIENDLY_ROLE_NAMES = (
     "cash_flow",
     "other",
 )
-_FRIENDLY_ROLE_BY_BUCKET = {
-    "BS": "balance_sheet",
-    "IS": "income_statement",
-    "CI": "comprehensive_income",
-    "EQ": "equity",
-    "CF": "cash_flow",
-    "DISC": "other",
-}
 
 _RATIO_LABEL_KEYWORDS = ("margin", "rate", "ratio", "yield", "penetration", "take rate", "mix")
 _PRICE_KEYWORDS = (
@@ -136,26 +101,6 @@ _VOLUME_KEYWORDS = (
 )
 
 
-def _role_canonicalize(role: str) -> str:
-    return str(role or "").lower().replace("-", "").replace("_", "").replace(" ", "")
-
-
-def _role_bucket(role: str) -> str:
-    canon = _role_canonicalize(role)
-    if not canon:
-        return "DISC"
-    if any(marker in canon for marker in _ROLE_DISCLOSURE_REJECT):
-        return "DISC"
-    for name, pattern in _ROLE_BUCKETS:
-        if pattern is not None and pattern.search(canon):
-            return name
-    return "DISC"
-
-
-def _friendly_role(bucket_name: str) -> str:
-    return _FRIENDLY_ROLE_BY_BUCKET.get(bucket_name, "other")
-
-
 def normalize_role_filter(raw: str | None) -> tuple[str, ...]:
     """Canonicalize comma-separated statement role filters for MCP requests."""
     if raw is None:
@@ -169,29 +114,6 @@ def normalize_role_filter(raw: str | None) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"Unknown statement role: {unknown[0]}")
     return tuple(sorted(values))
-
-
-def enrich_match_metadata(fact: dict) -> dict[str, Any]:
-    """Return statement-role metadata derived from one API fact."""
-    raw_role = fact.get("presentation_role")
-    roles = []
-    if raw_role is not None:
-        roles = [role.strip() for role in str(raw_role).split("|") if role.strip()]
-
-    presentation_roles = sorted(set(roles))
-    statement_roles = sorted({_friendly_role(_role_bucket(role)) for role in roles})
-    metadata: dict[str, Any] = {
-        "presentation_roles": presentation_roles,
-        "statement_roles": statement_roles,
-        "statement_position": (
-            "aggregate"
-            if fact.get("axis_key") in (None, "", "__NONE__")
-            else "dimensional"
-        ),
-    }
-    if len(statement_roles) == 1:
-        metadata["statement_role"] = statement_roles[0]
-    return metadata
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -251,6 +173,12 @@ FILE_OUTPUT_DIR = _get_output_dir()
 
 _FILING_ARTIFACT_KIND = "edgar.filing-markdown"
 _FILING_ARTIFACT_MEDIA_TYPE = "text/markdown"
+_LOCAL_FILING_ARTIFACT_PRODUCER = "get_filing_sections"
+_PATH_FREE_FILING_ARTIFACT_PRODUCER = "get_filing_sections_artifact"
+_FILING_ARTIFACT_PRODUCERS = (
+    _LOCAL_FILING_ARTIFACT_PRODUCER,
+    _PATH_FREE_FILING_ARTIFACT_PRODUCER,
+)
 _ARTIFACT_HANDLE_TTL_SECONDS = 15 * 60
 _MAX_FILING_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_ARTIFACT_RECORDS = 64
@@ -304,6 +232,10 @@ class _ArtifactCleanup:
 
 
 class _ArtifactCapacityError(ValueError):
+    pass
+
+
+class _ArtifactDeadlineError(TimeoutError):
     pass
 
 
@@ -675,6 +607,20 @@ def _apply_artifact_cleanup(
         os.close(root_fd)
 
 
+def _trusted_artifact_receipt(
+    source_name: str,
+    content: str,
+) -> _TrustedArtifactWriteReceipt:
+    trusted_content = content.encode("utf-8")
+    if len(trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
+        raise ValueError("Artifact exceeds the maximum supported size")
+    return _TrustedArtifactWriteReceipt(
+        source_name=_sanitize_artifact_source_name(source_name),
+        trusted_content=trusted_content,
+        sha256=hashlib.sha256(trusted_content).hexdigest(),
+    )
+
+
 def _write_trusted_artifact(path: Path, content: str) -> _TrustedArtifactWriteReceipt:
     """Write atomically and capture immutable provenance before close/rename."""
     root_path = FILE_OUTPUT_DIR.resolve(strict=True)
@@ -683,15 +629,23 @@ def _write_trusted_artifact(path: Path, content: str) -> _TrustedArtifactWriteRe
             "Trusted artifact output must be a flat file in the EDGAR output directory"
         )
 
-    trusted_content = content.encode("utf-8")
-    if len(trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
-        raise ValueError("Artifact exceeds the maximum supported size")
+    receipt = _trusted_artifact_receipt(path.name, content)
+    trusted_content = receipt.trusted_content
     write = atomic_write_flat_file(root_path, path.name, trusted_content)
     return _TrustedArtifactWriteReceipt(
         source_name=_sanitize_artifact_source_name(write.filename),
         trusted_content=trusted_content,
-        sha256=hashlib.sha256(trusted_content).hexdigest(),
+        sha256=receipt.sha256,
     )
+
+
+def _artifact_deadline_expired(deadline_monotonic: float | None) -> bool:
+    if deadline_monotonic is None:
+        return False
+    try:
+        return time.monotonic() >= float(deadline_monotonic)
+    except (TypeError, ValueError):
+        return True
 
 
 def _issue_artifact_handle(
@@ -701,7 +655,10 @@ def _issue_artifact_handle(
     kind: str,
     media_type: str,
     ttl_seconds: int = _ARTIFACT_HANDLE_TTL_SECONDS,
+    deadline_monotonic: float | None = None,
 ) -> _ArtifactRecord:
+    if _artifact_deadline_expired(deadline_monotonic):
+        raise _ArtifactDeadlineError("Request timed out before artifact issuance")
     if len(receipt.trusted_content) > _MAX_FILING_ARTIFACT_BYTES:
         raise ValueError("Artifact exceeds the maximum supported size")
     if len(receipt.trusted_content) > _MAX_ARTIFACT_REGISTRY_BYTES:
@@ -773,6 +730,9 @@ def _issue_artifact_handle(
                 "Artifact capability capacity is full; retry after an existing handle expires"
             )
 
+        if _artifact_deadline_expired(deadline_monotonic):
+            raise _ArtifactDeadlineError("Request timed out before artifact issuance")
+
         os.link(
             temp_filename,
             backing_filename,
@@ -791,6 +751,8 @@ def _issue_artifact_handle(
             raise OSError("Managed artifact backing publication failed")
         os.fsync(root_fd)
         expires_at = now + ttl
+        if _artifact_deadline_expired(deadline_monotonic):
+            raise _ArtifactDeadlineError("Request timed out before artifact issuance")
         connection.execute(
             """
             INSERT INTO artifact_capabilities (
@@ -816,6 +778,8 @@ def _issue_artifact_handle(
                 expires_at,
             ),
         )
+        if _artifact_deadline_expired(deadline_monotonic):
+            raise _ArtifactDeadlineError("Request timed out before artifact issuance")
         connection.commit()
         committed = True
         record = _ArtifactRecord(
@@ -873,6 +837,9 @@ def _issue_artifact_handle(
         root_stat.st_ino,
         cleanup,
     )
+    if _artifact_deadline_expired(deadline_monotonic):
+        _revoke_artifact_record(record)
+        raise _ArtifactDeadlineError("Request timed out before artifact issuance")
     return record
 
 
@@ -897,10 +864,68 @@ def _artifact_record_from_row(handle: str, root_path: Path, row: sqlite3.Row) ->
     return record
 
 
+def _revoke_artifact_record(record: _ArtifactRecord) -> None:
+    root_path, root_fd, root_stat = _open_managed_artifact_root(create=False)
+    connection: sqlite3.Connection | None = None
+    cleanup = _ArtifactCleanup((), (), ())
+    revoked_identity: _ManagedFileIdentity | None = None
+    try:
+        if (root_stat.st_dev, root_stat.st_ino) != (
+            record.root_device,
+            record.root_inode,
+        ) or str(root_path) != record.root_path:
+            raise ValueError("Artifact output directory identity changed after issuance")
+        connection = _connect_artifact_store(root_path, root_fd, create=False)
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM artifact_capabilities WHERE handle_sha256 = ?",
+            (_artifact_handle_digest(record.handle),),
+        ).fetchone()
+        cleanup = _derive_artifact_cleanup(connection, root_fd, time.time())
+        if row is not None:
+            observed = _artifact_record_from_row(record.handle, root_path, row)
+            if observed != record:
+                raise ValueError("Artifact capability identity changed after issuance")
+            connection.execute(
+                "DELETE FROM artifact_capabilities WHERE handle_sha256 = ?",
+                (_artifact_handle_digest(record.handle),),
+            )
+            revoked_identity = _ManagedFileIdentity(
+                filename=record.backing_filename,
+                device=record.file_device,
+                inode=record.file_inode,
+            )
+        connection.commit()
+    except Exception:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(root_fd)
+
+    if revoked_identity is not None:
+        cleanup = _ArtifactCleanup(
+            expired=(*cleanup.expired, revoked_identity),
+            orphaned=cleanup.orphaned,
+            stale_temporaries=cleanup.stale_temporaries,
+        )
+    _apply_artifact_cleanup(
+        root_path,
+        root_stat.st_dev,
+        root_stat.st_ino,
+        cleanup,
+    )
+
+
 def _resolve_artifact_handle(
     handle: str,
     *,
-    expected_producer: str,
+    expected_producer: str | tuple[str, ...],
     expected_kind: str,
     expected_media_type: str,
 ) -> tuple[_ArtifactRecord, bytes]:
@@ -944,7 +969,10 @@ def _resolve_artifact_handle(
     record = _artifact_record_from_row(normalized, root_path, row)
     if _artifact_is_expired(record.expires_at, now):
         raise ValueError("Artifact handle has expired")
-    if record.producer != expected_producer:
+    expected_producers = (
+        (expected_producer,) if isinstance(expected_producer, str) else expected_producer
+    )
+    if record.producer not in expected_producers:
         raise ValueError("Artifact handle was issued by the wrong producer")
     if record.kind != expected_kind or record.media_type != expected_media_type:
         raise ValueError("Artifact handle has the wrong kind or media type")
@@ -1031,12 +1059,152 @@ FilingQuarterArg = Annotated[
     ),
 ]
 
+
+class _FilingFactsMCPModel(BaseModel):
+    """Strict standalone MCP input model; the hosted HTTP API remains authoritative."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class FilingFactsIssuerArg(_FilingFactsMCPModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "anyOf": [
+                {
+                    "required": ["ticker"],
+                    "properties": {
+                        "ticker": {"type": "string", "minLength": 1}
+                    },
+                },
+                {
+                    "required": ["cik"],
+                    "properties": {
+                        "cik": {"type": "string", "pattern": r"^\d{1,10}$"}
+                    },
+                },
+            ]
+        },
+    )
+
+    ticker: str | None = Field(default=None, min_length=1, max_length=32)
+    cik: str | None = Field(default=None, pattern=r"^\d{1,10}$")
+
+    @model_validator(mode="after")
+    def _require_assertion(self) -> "FilingFactsIssuerArg":
+        if self.ticker is None and self.cik is None:
+            raise ValueError("issuer requires a ticker or CIK assertion")
+        return self
+
+
+class FilingFactsInstantPeriodArg(_FilingFactsMCPModel):
+    kind: Literal["instant"]
+    instant: date
+
+
+class FilingFactsDurationPeriodArg(_FilingFactsMCPModel):
+    kind: Literal["duration"]
+    start: date
+    end: date
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "FilingFactsDurationPeriodArg":
+        if self.start > self.end:
+            raise ValueError("duration start must not be after end")
+        return self
+
+
+class FilingFactsAllReportedPeriodsArg(_FilingFactsMCPModel):
+    kind: Literal["all_reported_periods"]
+
+
+FilingFactsExactPeriodArg = Annotated[
+    FilingFactsInstantPeriodArg | FilingFactsDurationPeriodArg,
+    Field(discriminator="kind"),
+]
+FilingFactsPeriodArg = Annotated[
+    FilingFactsInstantPeriodArg
+    | FilingFactsDurationPeriodArg
+    | FilingFactsAllReportedPeriodsArg,
+    Field(discriminator="kind"),
+]
+FilingFactsStatementRoleArg = Literal[
+    "balance_sheet",
+    "income_statement",
+    "comprehensive_income",
+    "equity",
+    "cash_flow",
+]
+
+
+class FilingFactsPrimaryStatementAggregateArg(_FilingFactsMCPModel):
+    id: str = Field(min_length=1, max_length=128)
+    qname: str = Field(min_length=3, max_length=1024)
+    period: FilingFactsExactPeriodArg
+    occurrence: Literal["primary_statement_aggregate"]
+    statement_role: FilingFactsStatementRoleArg | None = None
+
+    @field_validator("id", "qname")
+    @classmethod
+    def _strip_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+
+class FilingFactsAllOccurrencesArg(_FilingFactsMCPModel):
+    id: str = Field(min_length=1, max_length=128)
+    qname: str = Field(min_length=3, max_length=1024)
+    period: FilingFactsPeriodArg
+    occurrence: Literal["all_occurrences"]
+
+    @field_validator("id", "qname")
+    @classmethod
+    def _strip_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+
+FilingFactSelectorArg = Annotated[
+    FilingFactsPrimaryStatementAggregateArg | FilingFactsAllOccurrencesArg,
+    Field(discriminator="occurrence"),
+]
+
+
+def _require_unique_filing_fact_selector_ids(
+    selectors: list[
+        FilingFactsPrimaryStatementAggregateArg | FilingFactsAllOccurrencesArg
+    ],
+) -> list[FilingFactsPrimaryStatementAggregateArg | FilingFactsAllOccurrencesArg]:
+    ids = [selector.id for selector in selectors]
+    if len(ids) != len(set(ids)):
+        raise ValueError("selector ids must be unique within a request")
+    return selectors
+
+
+FilingFactSelectorsArg = Annotated[
+    list[FilingFactSelectorArg],
+    Field(
+        min_length=1,
+        max_length=25,
+        description=(
+            "One to 25 exact QName selectors. Each selector supplies a unique id, "
+            "QName, explicit period, and occurrence policy."
+        ),
+    ),
+    AfterValidator(_require_unique_filing_fact_selector_ids),
+]
+
 mcp = FastMCP(
     "edgar-parser-mcp",
     instructions=(
         "Parser-backed SEC EDGAR filing and financial data tools. Use get_filings for filing metadata, "
         "get_issuer_submissions_meta for public SEC issuer header metadata, "
         "get_financials for full facts, get_metric for specific facts, "
+        "get_filing_facts for exact-accession, exact-QName XBRL fact retrieval, "
         "get_metric_series for multi-period metric time series, warm_metric_cache "
         "to enqueue async cache warming, warm_metric_cache_status to poll warm jobs, "
         "get_concept for registry-backed concept values from cached financials, "
@@ -1071,10 +1239,6 @@ mcp = FastMCP(
 # Remote API helpers
 # ---------------------------------------------------------------------------
 
-_SEC_SUBMISSIONS_USER_AGENT = "edgar-parser henry@edgarparser.com"
-_SEC_SUBMISSIONS_THROTTLE_LOCK = threading.Lock()
-_SEC_SUBMISSIONS_LAST_CALL_MONOTONIC: float | None = None
-
 def _get_api_config():
     base_url = os.getenv("EDGAR_API_URL", "https://www.edgarparser.com").rstrip("/")
     api_key = os.getenv("EDGAR_API_KEY", "")
@@ -1089,13 +1253,19 @@ def _call_api(path: str, params: dict, timeout: int = 300) -> dict:
 
     url = f"{base_url}{path}"
     payload = dict(params)
-    payload["key"] = api_key
+    headers = {"Authorization": f"Bearer {api_key}"}
 
     t0 = time.time()
     try:
-        resp = requests.get(url, params=payload, timeout=timeout)
+        resp = requests.get(url, params=payload, headers=headers, timeout=timeout)
     except requests.RequestException as exc:
-        return {"status": "error", "message": f"EDGAR API request failed after {time.time()-t0:.1f}s: {exc}"}
+        return {
+            "status": "error",
+            "message": (
+                f"EDGAR API request failed after {time.time()-t0:.1f}s "
+                f"({exc.__class__.__name__})"
+            ),
+        }
 
     try:
         data = resp.json()
@@ -1103,9 +1273,10 @@ def _call_api(path: str, params: dict, timeout: int = 300) -> dict:
         return {"status": "error", "message": f"Invalid JSON from EDGAR API (HTTP {resp.status_code})"}
 
     if resp.status_code != 200:
-        if isinstance(data, dict) and data:
-            return data
-        return {"status": "error", "message": f"EDGAR API error (HTTP {resp.status_code})"}
+        return {
+            "status": "error",
+            "message": f"EDGAR API error (HTTP {resp.status_code})",
+        }
 
     return data
 
@@ -1123,23 +1294,11 @@ def _get_issuer_submissions_meta_impl(args: dict) -> dict:
     url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
 
     try:
-        global _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC
-        with _SEC_SUBMISSIONS_THROTTLE_LOCK:
-            now = time.monotonic()
-            if _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC is not None:
-                delay = 1.0 - (now - _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC)
-                if delay > 0:
-                    time.sleep(delay)
-            _SEC_SUBMISSIONS_LAST_CALL_MONOTONIC = time.monotonic()
-            response = requests.get(
-                url,
-                timeout=30,
-                headers={"User-Agent": _SEC_SUBMISSIONS_USER_AGENT},
-            )
+        response = sec_get(url, caller_label=__name__, timeout=30)
     except requests.RequestException as exc:
         return {
             "status": "error",
-            "message": f"SEC submissions request failed: {exc}",
+            "message": f"SEC submissions request failed ({exc.__class__.__name__})",
         }
 
     try:
@@ -1179,30 +1338,45 @@ def _get_issuer_submissions_meta_impl(args: dict) -> dict:
     }
 
 
-def _post_api(path: str, payload: dict, timeout: int = 300) -> dict:
+def _post_api(
+    path: str,
+    payload: dict,
+    timeout: int = 300,
+    *,
+    preserve_error_payload: bool = False,
+) -> dict:
     """HTTP POST to the remote EDGAR API. Returns parsed JSON or error dict."""
     base_url, api_key = _get_api_config()
     if not api_key:
         return {"status": "error", "message": "EDGAR_API_KEY is not configured"}
 
     url = f"{base_url}{path}"
-    params = {"key": api_key}
+    headers = {"Authorization": f"Bearer {api_key}"}
 
     t0 = time.time()
     try:
-        resp = requests.post(url, params=params, json=payload, timeout=timeout)
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     except requests.RequestException as exc:
-        return {"status": "error", "message": f"EDGAR API request failed after {time.time()-t0:.1f}s: {exc}"}
+        return {
+            "status": "error",
+            "message": (
+                f"EDGAR API request failed after {time.time()-t0:.1f}s "
+                f"({exc.__class__.__name__})"
+            ),
+        }
 
     try:
         data = resp.json()
     except ValueError:
         return {"status": "error", "message": f"Invalid JSON from EDGAR API (HTTP {resp.status_code})"}
 
-    if resp.status_code != 200:
-        if isinstance(data, dict) and data:
+    if not 200 <= resp.status_code < 300:
+        if preserve_error_payload and isinstance(data, dict):
             return data
-        return {"status": "error", "message": f"EDGAR API error (HTTP {resp.status_code})"}
+        return {
+            "status": "error",
+            "message": f"EDGAR API error (HTTP {resp.status_code})",
+        }
 
     return data
 
@@ -1330,46 +1504,6 @@ def _role_query_param(role: object) -> str | None:
 
     normalized = normalize_role_filter(raw)
     return ",".join(normalized) if normalized else None
-
-
-def _normalize_tag_local_name(value: object) -> str:
-    raw = str(value or "")
-    local = raw.split(":", 1)[1] if ":" in raw else raw
-    return re.sub(r"[^a-z0-9]", "", local.lower())
-
-
-def _dimension_tokens(fact: dict) -> set[str]:
-    tokens: set[str] = set()
-    axis_key = _normalize_tag_local_name(fact.get("axis_key"))
-    if axis_key:
-        tokens.add(axis_key)
-
-    dimensions = fact.get("dimensions")
-    if isinstance(dimensions, list):
-        for dimension in dimensions:
-            if not isinstance(dimension, dict):
-                continue
-            for field in (
-                "axis",
-                "axis_label",
-                "member",
-                "member_label",
-                "dimension",
-                "axis_name",
-                "member_name",
-            ):
-                normalized = _normalize_tag_local_name(dimension.get(field))
-                if normalized:
-                    tokens.add(normalized)
-    return tokens
-
-
-def _query_looks_operating_cash_flow_metric(tokens: set[str]) -> bool:
-    if tokens & {"cfo", "ocf"}:
-        return True
-    if {"cash", "flow"} <= tokens and not (tokens & _NON_OPERATING_CASH_FLOW_QUERY_TOKENS):
-        return bool(tokens & _OPERATING_CASH_FLOW_QUERY_TOKENS)
-    return False
 
 
 def _normalize_sections_source(value: object) -> str | None:
@@ -1729,20 +1863,6 @@ def _source_from_operational_span(
     }
 
 
-def _operational_pipe_table_group_start(text: str, row_start: int) -> int:
-    """Return the first character offset for the contiguous markdown table block."""
-    line_start = text.rfind("\n", 0, row_start) + 1
-    cursor = line_start
-    while cursor > 0:
-        previous_end = cursor - 1
-        previous_start = text.rfind("\n", 0, max(previous_end, 0)) + 1
-        previous_line = text[previous_start:previous_end]
-        if "|" not in previous_line or not previous_line.strip():
-            break
-        cursor = previous_start
-    return cursor
-
-
 def _operational_source_group_id(prefix: str, offset: int) -> str:
     return f"{prefix}:{offset}"
 
@@ -1906,10 +2026,6 @@ def _parse_operational_amount_cell_values(cells: list[str]) -> list[dict[str, An
     return values
 
 
-def _parse_operational_amount_cells(cells: list[str]) -> list[float]:
-    return [item["value"] for item in _parse_operational_amount_cell_values(cells)]
-
-
 def _clean_operational_metric_label(value: object) -> str:
     text = _clean_operational_text(value).strip("* ")
     text = re.sub(r"\(\s*\d+(?:\s*,\s*\d+)*\s*\)", "", text)
@@ -1933,15 +2049,6 @@ def _table_label_matches_operational_metric(label: object, metric: dict[str, Any
     )
 
 
-def _find_operational_metric_match(sentence: str, metric: dict[str, Any]) -> re.Match[str] | None:
-    for alias in _operational_metric_aliases(metric):
-        pattern = _operational_metric_regex(alias)
-        match = re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", sentence, re.IGNORECASE)
-        if match:
-            return match
-    return None
-
-
 def _parse_operational_percent_cell_values(cells: list[str]) -> list[dict[str, Any]]:
     values: list[dict[str, Any]] = []
     for index, cell in enumerate(cells):
@@ -1962,10 +2069,6 @@ def _parse_operational_percent_cell_values(cells: list[str]) -> list[dict[str, A
                 }
             )
     return values
-
-
-def _parse_operational_percent_cells(cells: list[str]) -> list[float]:
-    return [item["value"] for item in _parse_operational_percent_cell_values(cells)]
 
 
 def _driver_period_label(year: int, quarter: int) -> str:
@@ -2551,13 +2654,6 @@ def _iter_operational_pipe_table_blocks(text: str) -> list[dict[str, Any]]:
     return blocks
 
 
-def _iter_operational_pipe_table_rows(text: str) -> list[tuple[int, int, str, list[str], str]]:
-    rows: list[tuple[int, int, str, list[str], str]] = []
-    for block in _iter_operational_pipe_table_blocks(text):
-        rows.extend(block["rows"])
-    return rows
-
-
 def _operational_table_block_scale(block: dict[str, Any]) -> str | None:
     return _operational_scale_from_raw(" ".join(str(line) for line in block.get("lines", [])))
 
@@ -2813,7 +2909,7 @@ def _metric_discovery_args(args: dict) -> tuple[dict[str, Any], dict[str, Any]]:
     return search_args, list_args
 
 
-def _annotate_metric_cache_miss(response: dict, args: dict) -> dict:
+def _annotate_metric_cache_miss(response: dict) -> dict:
     if response.get("status") != "error":
         return response
 
@@ -2921,7 +3017,7 @@ def _operational_row_is_dimension_member(label: object, block: dict[str, Any]) -
 def _operational_table_block_has_operating_context(block: dict[str, Any]) -> bool:
     signal_count = 0
     for _start, _end, label, cells, _line in block.get("rows", []):
-        if len(_parse_operational_amount_cells(cells[1:])) < 2:
+        if len(_parse_operational_amount_cell_values(cells[1:])) < 2:
             continue
         if _operational_label_has_metric_signal(label) or _operational_label_matches_registry_metric(label):
             signal_count += 1
@@ -2991,7 +3087,7 @@ def _operational_table_block_relevant(block: dict[str, Any], metrics: list[dict[
     for _start, _end, label, cells, _line in block.get("rows", []):
         if _operational_row_is_dimension_member(label, block):
             continue
-        if len(_parse_operational_amount_cells(cells[1:])) < 2:
+        if len(_parse_operational_amount_cell_values(cells[1:])) < 2:
             continue
         for metric in metrics:
             if _table_label_matches_operational_metric(label, metric):
@@ -3045,8 +3141,7 @@ def _discover_table_operational_metrics(text: str, topic: object) -> list[dict[s
         for _start, _end, label, cells, line in block.get("rows", []):
             if not _operational_table_label_allowed(label):
                 continue
-            amount_values = _parse_operational_amount_cells(cells[1:])
-            if len(amount_values) < 2:
+            if len(_parse_operational_amount_cell_values(cells[1:])) < 2:
                 continue
             score = _score_operational_label_against_topic(label, topic)
             if not _operational_table_label_is_discoverable(label, block=block, topic=topic, score=score):
@@ -3349,6 +3444,10 @@ def _extract_operational_driver_rows(
 
 
 _SPECIAL_SECTION_ALIASES = {
+    "cover": "cover_page",
+    "cover_page": "cover_page",
+    "coverpage": "cover_page",
+    "filing_cover": "cover_page",
     "earnings_release": "earnings_release",
     "earnings_press_release": "earnings_release",
     "proxy_statement": "proxy_statement",
@@ -3359,6 +3458,8 @@ _SPECIAL_SECTION_ALIASES = {
     "foreign_issuer_report": "foreign_report",
     "form_6_k": "foreign_report",
     "6_k": "foreign_report",
+    "signature": "signatures",
+    "signatures": "signatures",
 }
 
 
@@ -3550,7 +3651,12 @@ def _proxy_describe_filing(args: dict) -> dict:
 
 
 def _proxy_get_financials(args: dict) -> dict:
-    output_mode = args.get("output", "file")
+    output_mode = args.get("output", "inline")
+    if output_mode not in {"inline", "file"}:
+        return {
+            "status": "error",
+            "message": "output must be inline or file",
+        }
 
     result = _call_api("/api/financials", {
         "ticker": args["ticker"],
@@ -3592,8 +3698,11 @@ def _proxy_get_financials(args: dict) -> dict:
         "quarter": quarter,
         "filing_type": filing_type,
         "output": "file",
-        "file_path": str(file_path.resolve()),
-        "hint": "Use Read tool with file_path. Use jq or Grep to search for specific metrics.",
+        "file_path": str(file_path),
+        "hint": (
+            "Explicit local file output. Read file_path only from the same trusted "
+            "local MCP environment."
+        ),
         "metadata": {
             "total_facts": len(facts),
             "source": source_info,
@@ -3607,6 +3716,22 @@ def _proxy_get_financials(args: dict) -> dict:
     if result.get("scope_bridges"):
         response["scope_bridges"] = result.get("scope_bridges")
     return response
+
+
+def _proxy_get_filing_facts(args: dict) -> dict:
+    """Forward one exact filing-facts request without reshaping its response."""
+    payload = {
+        "issuer": args["issuer"],
+        "filing": {"accession": args["accession"]},
+        "selectors": args["selectors"],
+        "fetch_policy": args["fetch_policy"],
+    }
+    return _post_api(
+        "/api/filing/facts/query",
+        payload,
+        timeout=300,
+        preserve_error_payload=True,
+    )
 
 
 def _proxy_get_metric(args: dict) -> dict:
@@ -3633,7 +3758,7 @@ def _proxy_get_metric(args: dict) -> dict:
     if role_param:
         params["role"] = role_param
     response = _call_api("/api/metric", params)
-    response = _annotate_metric_cache_miss(response, args)
+    response = _annotate_metric_cache_miss(response)
     response = _annotate_operational_kpi_metric_miss(response, args)
     return _annotate_financial_metric_miss(response, args)
 
@@ -3949,8 +4074,13 @@ def _proxy_search_metrics(args: dict) -> dict:
 
 
 def _proxy_get_filing_sections(args: dict) -> dict:
-    """Proxy filing sections to remote API, with local file-write for output='file'."""
-    output_mode = args.get("output", "file")
+    """Proxy filing sections, optionally issuing a local file or private artifact."""
+    output_mode = args.get("output", "inline")
+    if output_mode not in {"inline", "file", "artifact"}:
+        return {
+            "status": "error",
+            "message": "output must be inline, file, or artifact",
+        }
     sections_list = _normalize_requested_sections(args.get("sections"))
     tables_only = args.get("tables_only", False)
     include_tables = bool(args.get("include_tables", False))
@@ -3978,8 +4108,8 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     if fallback:
         params["fallback"] = "true"
 
-    if output_mode == "file":
-        # Fetch full untruncated text for file output
+    if output_mode in {"file", "artifact"}:
+        # File and artifact output both capture the full untruncated source bytes.
         params["format"] = "full"
         params["max_words"] = "none"
     else:
@@ -4020,10 +4150,11 @@ def _proxy_get_filing_sections(args: dict) -> dict:
                     table_words += len(table_text.split())
             section["word_count"] = table_words
 
-    if output_mode != "file":
+    if output_mode == "inline":
         return result
 
-    # Write sections to local markdown file
+    # Render one exact markdown snapshot for either explicit local publication or
+    # the private path-free artifact store.
     ticker = _safe_filename_part(str(args["ticker"]).upper(), "ticker")
     year = int(args["year"])
     quarter = int(args["quarter"])
@@ -4052,7 +4183,10 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     root_dir = FILE_OUTPUT_DIR.resolve()
     file_path = root_dir / filename
     if _deadline_expired(args):
-        return {"status": "error", "message": "Request timed out before file output could be written"}
+        return {
+            "status": "error",
+            "message": "Request timed out before section output could be prepared",
+        }
 
     # Build markdown
     total_words = sum(s.get("word_count", 0) for s in sections_data.values())
@@ -4090,13 +4224,14 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     if lines and lines[-1] == "---":
         lines.pop()
 
-    write_receipt = _write_trusted_artifact(
-        file_path,
-        "\n".join(lines).strip() + "\n",
-    )
+    rendered_markdown = "\n".join(lines).strip() + "\n"
+    if output_mode == "file":
+        write_receipt = _write_trusted_artifact(file_path, rendered_markdown)
+    else:
+        write_receipt = _trusted_artifact_receipt(filename, rendered_markdown)
 
     tables_file_path: Path | None = None
-    if include_tables:
+    if output_mode == "file" and include_tables:
         tables_structured = result.get("tables_structured", {}) or {}
         if file_path.name.endswith("_sections.md"):
             tables_filename = f"{file_path.name[:-len('_sections.md')]}_tables.json"
@@ -4114,18 +4249,39 @@ def _proxy_get_filing_sections(args: dict) -> dict:
     try:
         artifact_record = _issue_artifact_handle(
             write_receipt,
-            producer="get_filing_sections",
+            producer=(
+                _LOCAL_FILING_ARTIFACT_PRODUCER
+                if output_mode == "file"
+                else _PATH_FREE_FILING_ARTIFACT_PRODUCER
+            ),
             kind=_FILING_ARTIFACT_KIND,
             media_type=_FILING_ARTIFACT_MEDIA_TYPE,
+            deadline_monotonic=args.get("__deadline_monotonic"),
         )
+        issued_records = args.get("__issued_artifact_records")
+        if isinstance(issued_records, list):
+            issued_records.append(artifact_record)
     except _ArtifactCapacityError as exc:
         return {
             "status": "error",
             "error_type": "artifact_capacity_exceeded",
             "message": str(exc),
         }
+    except _ArtifactDeadlineError:
+        return {
+            "status": "error",
+            "message": "Request timed out before artifact issuance",
+        }
 
-    # Return summary (no full text inline) + file_path
+    if _deadline_expired(args):
+        _revoke_artifact_record(artifact_record)
+        return {
+            "status": "error",
+            "message": "Request timed out before artifact issuance",
+        }
+
+    # Return a bounded summary. Only explicit trusted-local file mode exposes a
+    # public convenience coordinate; artifact mode returns the private handle.
     summary_sections = {
         key: {
             "header": s.get("header"),
@@ -4149,8 +4305,7 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         "year": year,
         "quarter": quarter,
         "filing_type": filing_type,
-        "output": "file",
-        "file_path": str(file_path),
+        "output": output_mode,
         "artifact_handle": artifact_record.handle,
         "artifact_kind": artifact_record.kind,
         "artifact_media_type": artifact_record.media_type,
@@ -4158,7 +4313,6 @@ def _proxy_get_filing_sections(args: dict) -> dict:
             artifact_record.expires_at,
             tz=UTC,
         ).isoformat(),
-        "hint": "Use Read tool with file_path. Grep '^## SECTION:' for anchors.",
         "sections": summary_sections,
         **aggregates,
         "metadata": {
@@ -4202,8 +4356,20 @@ def _proxy_get_filing_sections(args: dict) -> dict:
         response["result_status"] = result["result_status"]
     if "result_message" in result:
         response["result_message"] = result["result_message"]
-    if tables_file_path is not None:
-        response["tables_file_path"] = str(tables_file_path)
+    if output_mode == "file":
+        response["file_path"] = str(file_path)
+        response["hint"] = (
+            "Explicit local file output. Read file_path only from the same trusted "
+            "local MCP environment."
+        )
+        if tables_file_path is not None:
+            response["tables_file_path"] = str(tables_file_path)
+    if _deadline_expired(args):
+        _revoke_artifact_record(artifact_record)
+        return {
+            "status": "error",
+            "message": "Request timed out before artifact issuance",
+        }
     return response
 
 
@@ -4475,7 +4641,7 @@ def _proxy_extract_filing_file(args: dict) -> dict:
     try:
         record, original_bytes = _resolve_artifact_handle(
             str(args.get("artifact_handle") or ""),
-            expected_producer="get_filing_sections",
+            expected_producer=_FILING_ARTIFACT_PRODUCERS,
             expected_kind=_FILING_ARTIFACT_KIND,
             expected_media_type=_FILING_ARTIFACT_MEDIA_TYPE,
         )
@@ -4562,12 +4728,11 @@ def _proxy_extract_filing_file(args: dict) -> dict:
 
     normalized = _normalize_extraction_rows(extractions)
     grounded_count = sum(1 for item in normalized if item.get("grounded", True))
-    return {
+    response = {
         "status": "ok",
         "scratch_source_id": scratch_source_id,
         "request_document_handle": request_document_handle or scratch_source_id,
         "schema_used": schema_name,
-        "artifact_handle": record.handle,
         "artifact_kind": record.kind,
         "artifact_media_type": record.media_type,
         "artifact_producer": record.producer,
@@ -4576,6 +4741,12 @@ def _proxy_extract_filing_file(args: dict) -> dict:
         "total_count": len(normalized),
         "extractions": normalized,
     }
+    if record.producer == _PATH_FREE_FILING_ARTIFACT_PRODUCER:
+        _revoke_artifact_record(record)
+        response["artifact_consumed"] = True
+    else:
+        response["artifact_handle"] = record.handle
+    return response
 
 
 def _proxy_get_filing_extractions(args: dict) -> dict:
@@ -4720,7 +4891,7 @@ def _json_text(payload: dict) -> str:
         fallback = {
             "status": "error",
             "message": "Failed to serialize MCP tool response",
-            "details": str(exc),
+            "error_type": exc.__class__.__name__,
         }
         return json.dumps(fallback, indent=2)
 
@@ -4735,6 +4906,7 @@ _TOOL_DISPATCH = {
     "get_issuer_submissions_meta": _get_issuer_submissions_meta_impl,
     "describe_filing": _proxy_describe_filing,
     "get_financials": _proxy_get_financials,
+    "get_filing_facts": _proxy_get_filing_facts,
     "get_metric": _proxy_get_metric,
     "get_concept": _proxy_get_concept,
     "cite_concept": _proxy_cite_concept,
@@ -4769,6 +4941,7 @@ _TOOL_TIMEOUT = {
     "get_issuer_submissions_meta": 30,
     "describe_filing": 30,
     "get_financials": 300,
+    "get_filing_facts": 300,
     "get_metric": 300,
     "get_concept": 300,
     "cite_concept": 600,
@@ -4805,6 +4978,8 @@ async def _run_tool_guarded(name: str, arguments: dict | None = None) -> dict:
 
     timeout = _TOOL_TIMEOUT.get(name, 60)
     call_args = dict(arguments or {})
+    issued_artifact_records: list[_ArtifactRecord] = []
+    call_args["__issued_artifact_records"] = issued_artifact_records
     call_args["__deadline_monotonic"] = time.monotonic() + timeout
     try:
         with redirect_stdout(sys.stderr):
@@ -4813,9 +4988,18 @@ async def _run_tool_guarded(name: str, arguments: dict | None = None) -> dict:
                 timeout=timeout,
             )
     except asyncio.TimeoutError:
+        for record in tuple(issued_artifact_records):
+            try:
+                _revoke_artifact_record(record)
+            except (OSError, sqlite3.Error, ValueError):
+                continue
         result = {"status": "error", "message": f"Tool '{name}' timed out after {timeout}s"}
     except Exception as exc:
-        result = {"status": "error", "message": f"Unhandled error in MCP tool '{name}': {exc}"}
+        result = {
+            "status": "error",
+            "message": f"Unhandled error in MCP tool '{name}'",
+            "error_type": exc.__class__.__name__,
+        }
 
     try:
         normalized = json.loads(_json_text(result))
@@ -4823,7 +5007,7 @@ async def _run_tool_guarded(name: str, arguments: dict | None = None) -> dict:
         return {
             "status": "error",
             "message": "Failed to deserialize MCP tool response",
-            "details": str(exc),
+            "error_type": exc.__class__.__name__,
         }
 
     if isinstance(normalized, dict):
@@ -4934,11 +5118,17 @@ async def get_financials(
     ] = "auto",
     output: Annotated[
         Literal["inline", "file"],
-        Field(description="Use file for large fact sets; inline only for small/debug reads."),
-    ] = "file",
+        Field(
+            description=(
+                "Return inline JSON by default. Explicit file mode is only for a "
+                "trusted local MCP caller that can read the returned local path."
+            )
+        ),
+    ] = "inline",
 ) -> dict:
     """
-    Extract all financial facts from one fiscal filing. Required call shape:
+    Extract matcher-produced numeric financial rows from one fiscal filing.
+    Required call shape:
     `get_financials(ticker="MSCI", year=2024, quarter=4, full_year_mode=True)`.
 
     This is not a multi-year/list endpoint. Do not pass `years`, `period`,
@@ -4960,6 +5150,61 @@ async def get_financials(
             "full_year_mode": full_year_mode,
             "source": source,
             "output": output,
+        },
+    )
+
+
+@mcp.tool()
+async def get_filing_facts(
+    issuer: Annotated[
+        FilingFactsIssuerArg,
+        Field(
+            description=(
+                "Exact issuer assertion with ticker and/or CIK, for example "
+                "{'ticker': 'PCTY'} or {'cik': '0001591698'}."
+            )
+        ),
+    ],
+    accession: Annotated[
+        str,
+        Field(
+            pattern=r"^\d{10}-\d{2}-\d{6}$",
+            description="Exact SEC filing accession in ##########-##-###### form.",
+        ),
+    ],
+    selectors: FilingFactSelectorsArg,
+    fetch_policy: Annotated[
+        Literal["cache_only", "allow_fetch"],
+        Field(
+            description=(
+                "Use cache_only for a read-only cache lookup or allow_fetch to "
+                "materialize the exact accession on a cache miss."
+            )
+        ),
+    ],
+) -> dict:
+    """
+    Retrieve reported XBRL facts from one exact SEC filing accession.
+
+    This tool performs exact QName lookup, not concept discovery or fuzzy
+    matching. Use list_metrics or search_metrics before this call when the
+    filing's QName is not already known. Every selector must name an exact
+    instant, exact duration, or (for all_occurrences only) all reported periods.
+    Normalization completeness is enforced per QName: an unsupported occurrence
+    fails requests for that QName without blocking unrelated exact lookups.
+    The response is the hosted HTTP filing_facts.v1 payload without MCP-side
+    selection or semantic reshaping.
+    """
+    return await _run_tool_guarded(
+        "get_filing_facts",
+        {
+            "issuer": issuer.model_dump(mode="json", exclude_none=True),
+            "accession": accession,
+            "selectors": [
+                selector.model_dump(mode="json", exclude_none=True)
+                for selector in selectors
+            ],
+            "fetch_policy": fetch_policy,
         },
     )
 
@@ -5405,7 +5650,16 @@ async def get_filing_sections(
     include_tables: bool = False,
     tables_only: bool = False,
     fallback: bool = False,
-    output: Literal["inline", "file"] = "file",
+    output: Annotated[
+        Literal["inline", "file", "artifact"],
+        Field(
+            description=(
+                "Return inline sections by default. Explicit file mode publishes a "
+                "trusted-local path. Artifact mode returns a path-free, short-lived "
+                "handle for server-owned extract_filing_file flows."
+            )
+        ),
+    ] = "inline",
 ) -> dict:
     """
     Parse qualitative sections from one filing resolved by ticker/year/quarter.
@@ -5951,8 +6205,10 @@ async def extract_filing_file(
     identity.
 
     Discovery: choose schema_name from list_extraction_schemas and pass the
-    artifact_handle returned by get_filing_sections(output="file"). Local file
-    paths and unregistered bytes are never accepted.
+    artifact_handle returned by get_filing_sections(output="artifact") or by
+    explicit trusted-local file mode. Local file paths and unregistered bytes
+    are never accepted. Artifact-mode handles are consumed by this operation;
+    explicit local-file handles remain reusable until expiry.
     """
     args = {
         "artifact_handle": artifact_handle,

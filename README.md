@@ -37,7 +37,7 @@ Claude Desktop / Claude Code config:
 
 ## Tool Inventory
 
-This package exposes 31 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
+This package exposes 32 public MCP tools. The inventory below is generated from the same manifest that drives the hosted API documentation.
 
 | Tool | Summary | Tier | Cache Behavior |
 | --- | --- | --- | --- |
@@ -60,7 +60,8 @@ This package exposes 31 public MCP tools. The inventory below is generated from 
 | `search_filing_tables` | Search cached filing table metadata across a ticker and period range. | `public` | `cache_only` |
 | `compare_filing_tables` | Compare matching filing tables across multiple tickers. | `public` | `cache_only` |
 | `search_filing_text` | Search cached markdown within one filing and return matching spans. | `registered` | `cache_only` |
-| `get_financials` | Return the full structured XBRL financial fact payload for one filing period. | `public` | `cache_only` |
+| `get_financials` | Return matcher-produced numeric financial rows for one fiscal filing period. | `public` | `cache_only` |
+| `get_filing_facts` | Retrieve known exact-QName XBRL facts from one exact SEC filing accession via cache-only lookup or allowed fetch; use metric tools for discovery. | `registered` | `cold_allowed` |
 | `get_metric` | Return one discovered metric or XBRL tag with current, prior, and YoY values. | `public` | `cache_only` |
 | `get_metric_series` | Return one metric across multiple periods with per-period cache and coverage status. | `public` | `cache_only` |
 | `list_metrics` | List exact metric candidates available in one filing period. | `public` | `cache_only` |
@@ -97,7 +98,7 @@ This package exposes 31 public MCP tools. The inventory below is generated from 
 
 ### XBRL and Concepts
 
-`get_financials`, `get_metric`, `get_metric_series`, `list_metrics`, `search_metrics`, `get_statement`, `get_concept`, `compare_concept`, `concept_trend`, `cite_concept`, `warm_metric_cache`, `warm_metric_cache_status`
+`get_financials`, `get_filing_facts`, `get_metric`, `get_metric_series`, `list_metrics`, `search_metrics`, `get_statement`, `get_concept`, `compare_concept`, `concept_trend`, `cite_concept`, `warm_metric_cache`, `warm_metric_cache_status`
 
 ## Runtime Notes
 
